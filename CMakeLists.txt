@@ -5,7 +5,6 @@ set(CMAKE_CXX_STANDARD 14)
 
 include_directories(include)
 include_directories(include/mmio)
-include_directories(/root/local/include)
 
 set(CMAKE_CUDA_ARCHITECTURES "70")
 find_package(CUDAToolkit ${NVCC_VER_MIN} REQUIRED)
@@ -51,7 +50,8 @@ list(APPEND CMAKE_CUDA_FLAGS "-O3 -Xptxas -O3 -Xcompiler -O3 -Xcompiler -fopenmp
 target_link_libraries(MG_GCD
         CUDA::cudart
         OpenMP::OpenMP_CXX
-        nvshmem::nvshmem
+        nvshmem::nvshmem_host
+        nvshmem::nvshmem_device
         MPI::MPI_CXX
         )
 
