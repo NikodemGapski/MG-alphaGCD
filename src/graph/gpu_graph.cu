@@ -13,8 +13,10 @@ mass_(hostGraph->get_mass_())
     shared_device_community_ids_ = (vertex_t *) nvshmem_malloc (total_vertices_ * sizeof(vertex_t));
     shared_device_community_weight_ = (weight_t *) nvshmem_malloc (total_vertices_ * sizeof(weight_t));
     shared_device_community_delta_weight_ = (weight_t *) nvshmem_malloc (total_vertices_ * sizeof(weight_t));
+    shared_device_community_q_out_ = (weight_t *) nvshmem_malloc (total_vertices_ * sizeof(weight_t));
     CUDA_RT_CALL(cudaMemset(shared_device_community_weight_, 0., total_vertices_ * sizeof(weight_t)));
     CUDA_RT_CALL(cudaMemset(shared_device_community_delta_weight_, 0., total_vertices_ * sizeof(weight_t)));
+    CUDA_RT_CALL(cudaMemset(shared_device_community_q_out_, 0., total_vertices_ * sizeof(weight_t)));
 }
 
 vertex_t *GpuGraph::get_private_device_offset_() {
@@ -63,6 +65,10 @@ weight_t *GpuGraph::get_shared_device_community_weight_() {
 
 weight_t *GpuGraph::get_shared_device_community_delta_weight_() {
     return shared_device_community_delta_weight_;
+}
+
+weight_t *GpuGraph::get_shared_device_community_q_out_() {
+    return shared_device_community_q_out_;
 }
 
 weight_t *GpuGraph::get_private_device_vertex_weight_() {

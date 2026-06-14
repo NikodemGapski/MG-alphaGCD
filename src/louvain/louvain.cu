@@ -102,6 +102,286 @@ __global__ void copy(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Objective seam: the local-move gain function.
+//
+// MG-alphaGCD originally maximised modularity. This build optimises the
+// two-level *map equation* (Infomap) instead, for undirected graphs with no
+// teleportation (tau = 0), where the random-walk flows have closed forms:
+//     p_vis[v] = k_v / 2m,  q_vis[i] = vol(i) / 2m,  q_out[i] = cut(i) / 2m.
+// `move_gain<O>` returns a value that is *maximised* over candidate moves; for
+// the map equation that is the codelength decrease (-dL), so the surrounding
+// Louvain driver (which maximises a score and only accepts positive moves) is
+// reused unchanged. Switch ACTIVE_OBJECTIVE back to Modularity to recover the
+// original algorithm.
+// ---------------------------------------------------------------------------
+
+enum class Objective { Modularity, MapEquation };
+
+// Active objective for the optimized (version 2) path.
+constexpr Objective ACTIVE_OBJECTIVE = Objective::MapEquation;
+
+// p*log2(p), with the entropy convention F(0) = 0.
+__device__ __forceinline__ weight_t plogp(weight_t x) {
+    return x > 0.0 ? x * log2(x) : 0.0;
+}
+
+// e_vn   : weight of edges from v to candidate community n   (hash_table_value)
+// eici   : weight of edges from v to its own community m
+// ki     : weighted degree of v
+// aci    : vol(m) - ki   (source community weight, already reduced by ki)
+// acj    : vol(n)        (candidate community weight)
+// qout_m : exit (cut) weight of m, raw units
+// qout_n : exit (cut) weight of n, raw units
+// q_total: global sum of exit weights, raw units (= Sum_i cut_i)
+// mass   : m  (i.e. half of 2m -- the kernels pass mass after `mass /= 2`)
+template <Objective O>
+__device__ __forceinline__ weight_t move_gain(
+    weight_t e_vn, weight_t eici, weight_t ki,
+    weight_t aci, weight_t acj,
+    weight_t qout_m, weight_t qout_n, weight_t q_total, weight_t mass);
+
+template <>
+__device__ __forceinline__ weight_t move_gain<Objective::Modularity>(
+    weight_t e_vn, weight_t eici, weight_t ki,
+    weight_t aci, weight_t acj,
+    weight_t /*qout_m*/, weight_t /*qout_n*/, weight_t /*q_total*/, weight_t mass)
+{
+    weight_t wij = e_vn;
+    wij -= (eici - ki * (aci - acj) / (2. * mass));
+    wij /= mass;
+    return wij;
+}
+
+template <>
+__device__ __forceinline__ weight_t move_gain<Objective::MapEquation>(
+    weight_t e_vn, weight_t eici, weight_t ki,
+    weight_t aci, weight_t acj,
+    weight_t qout_m, weight_t qout_n, weight_t q_total, weight_t mass)
+{
+    const weight_t two_m  = 2.0 * mass;                 // = 2m
+    const weight_t p_v    = ki / two_m;                 // p_vis[v]
+    const weight_t qvis_m = (aci + ki) / two_m;         // q_vis[m] (vol incl. v)
+    const weight_t qvis_n = acj / two_m;                // q_vis[n]
+    const weight_t qom    = qout_m / two_m;             // q_out[m]
+    const weight_t qon    = qout_n / two_m;             // q_out[n]
+    const weight_t Qp     = q_total / two_m;            // Q = Sum_i q_out[i]
+    // change in module exit probabilities (undirected, tau = 0)
+    const weight_t dqm    = (2.0 * eici - ki) / two_m;  // v leaves m: dcut = 2*e_vm - k_v
+    const weight_t dqn    = (ki - 2.0 * e_vn) / two_m;  // v joins n:  dcut = k_v - 2*e_vn
+
+    const weight_t dL =
+          (plogp(Qp + dqm + dqn) - plogp(Qp))
+        - 2.0 * ( (plogp(qom + dqm) - plogp(qom))
+                + (plogp(qon + dqn) - plogp(qon)) )
+        + (plogp((qom + dqm) + (qvis_m - p_v)) - plogp(qom + qvis_m))
+        + (plogp((qon + dqn) + (qvis_n + p_v)) - plogp(qon + qvis_n));
+
+    return -dL;  // maximise the codelength decrease
+}
+
+// Map equation: fill `shared_device_community_q_out_delta` (indexed by *global*
+// module id) with this PE's partial exit weight, i.e. for every local vertex the
+// sum of its edge weights that cross into a different module. Mirrors the
+// inter-community edge loop of compute_modularity but accumulates per module.
+__global__ void __launch_bounds__(1024, 1)
+compute_community_q_out_local_atomic(
+    vertex_t local_vertices,
+    vertex_t total_vertices,
+    vertex_t* private_device_offset,
+    edge_t* private_device_edge,
+    weight_t* private_device_edge_weight,
+    vertex_t* private_device_part_vertex_offset,
+    vertex_t* shared_device_community_ids,
+    weight_t* shared_device_community_q_out_delta,
+    int my_pe,
+    int n_pes
+)
+{
+    cg::grid_group grid = cg::this_grid();
+    cg::thread_block block = cg::this_thread_block();
+    auto tile32 = cg::tiled_partition<32>(block);
+    int tile32_num_grid = grid.num_threads() / 32;
+    int tile32_id_grid = block.num_threads() * block.group_index().x / 32 + block.thread_index().x / 32;
+
+    // zero the per-global-module scratch
+    for (vertex_t i = grid.thread_rank(); i < total_vertices; i += grid.num_threads()) {
+        shared_device_community_q_out_delta[i] = 0.;
+    }
+    grid.sync();
+
+    vertex_t vertex_id;
+    edge_t e;
+    vertex_t src_community_id;
+    vertex_t dst_community_id;
+    vertex_t neighbor_id;
+    int pe_dst;
+    weight_t w_ext;
+
+    // each vertex is handled by one tile32; accumulate its external edge weight
+    for (vertex_id = tile32_id_grid; vertex_id < local_vertices; vertex_id += tile32_num_grid) {
+        src_community_id = shared_device_community_ids[vertex_id];
+        w_ext = 0.;
+        for (e = private_device_offset[vertex_id] + tile32.thread_rank(); e < private_device_offset[vertex_id + 1]; e += 32) {
+            neighbor_id = private_device_edge[e];
+            locating_vertex(pe_dst, neighbor_id, private_device_part_vertex_offset, n_pes);
+            if (pe_dst == my_pe) {
+                dst_community_id = shared_device_community_ids[neighbor_id];
+            } else {
+                dst_community_id = nvshmem_uint32_g(shared_device_community_ids + neighbor_id, pe_dst);
+            }
+            if (src_community_id != dst_community_id) {
+                w_ext += private_device_edge_weight[e];   // self-loops have src==dst -> excluded
+            }
+        }
+        w_ext = cg::reduce(tile32, w_ext, cg::plus<weight_t>());
+        if (tile32.thread_rank() == 0 && w_ext != 0.) {
+            atomicAdd(shared_device_community_q_out_delta + src_community_id, w_ext);
+        }
+    }
+}
+
+// Map equation: reduce the per-global-module partial exit weights across PEs into
+// the owning PE's `shared_device_community_q_out` (local module range). Mirrors
+// compute_community_weight, but assigns (zero + sum) instead of accumulating.
+__global__ void __launch_bounds__(1024, 1)
+compute_community_q_out(
+    vertex_t local_vertices,
+    vertex_t total_vertices,
+    weight_t* shared_device_community_q_out,
+    weight_t* shared_device_community_q_out_delta,
+    vertex_t* private_device_part_vertex_offset,
+    int my_pe,
+    int n_pes
+)
+{
+    int i;
+    int j;
+    int nelems;
+    cg::grid_group grid = cg::this_grid();
+    cg::thread_block block = cg::this_thread_block();
+    auto tile32 = cg::tiled_partition<32>(block);
+    int tile_num_grid = grid.num_threads() / 32;
+    int tile_id_grid = grid.thread_rank() / 32;
+    int shared_offset = (block.thread_rank() / 32) * 32;
+    vertex_t start_vertex_id = private_device_part_vertex_offset[my_pe];
+
+    __shared__ double buff[1024];
+
+    // zero the owning-PE local q_out range
+    for (vertex_t v = grid.thread_rank(); v < local_vertices; v += grid.num_threads()) {
+        shared_device_community_q_out[v] = 0.;
+    }
+    grid.sync();
+
+    int local_tile;
+    int remote_tile;
+    if (n_pes == 1) {
+        local_tile = tile_num_grid;
+        remote_tile = 0;
+    } else {
+        local_tile = tile_num_grid / n_pes;
+        remote_tile = tile_num_grid - local_tile;
+    }
+
+    // local workload: this PE's own partial contribution
+    if (tile_id_grid < local_tile) {
+        for (j = tile_id_grid * tile32.num_threads() + tile32.thread_rank(); j < local_vertices; j += (local_tile * tile32.num_threads())) {
+            atomicAdd(shared_device_community_q_out + j, shared_device_community_q_out_delta[start_vertex_id + j]);
+        }
+    }
+    // remote workload: other PEs' partial contributions
+    else {
+        for (vertex_t tile_offset = (tile_id_grid - local_tile) * tile32.num_threads(); tile_offset < local_vertices; tile_offset += (remote_tile * tile32.num_threads())) {
+            nelems = min(tile32.num_threads(), local_vertices - tile_offset);
+            for (i = 1; i < n_pes; i++) {
+                nvshmemx_double_get_warp(buff + shared_offset, shared_device_community_q_out_delta + start_vertex_id + tile_offset, nelems, (my_pe + i) % n_pes);
+                for (j = tile32.thread_rank(); j < nelems; j += tile32.num_threads()) {
+                    atomicAdd(shared_device_community_q_out + tile_offset + j, buff[shared_offset + j]);
+                }
+            }
+        }
+    }
+}
+
+// Map equation: assemble the two-level codelength L from the per-module exit
+// weights (q_out) and volumes (community_weight) and the per-node visit rates,
+// then write the maximisable score (-L) into Q and the raw exit sum into Q_sum.
+//     L = F(Q) - 2*Sum_i F(q_out_i) - Sum_v F(p_vis_v) + Sum_i F(q_out_i + q_vis_i)
+// with q_out_i = cut_i/2m, q_vis_i = vol_i/2m, p_vis_v = k_v/2m, F(x)=x*log2(x).
+// `mass` is the original 2m (not halved). `cl_reduce` is 4 doubles of symmetric scratch.
+__global__ void __launch_bounds__(1024, 1)
+compute_codelength(
+    weight_t mass,
+    vertex_t local_vertices,
+    weight_t* shared_device_community_weight,
+    weight_t* shared_device_community_q_out,
+    weight_t* private_device_vertex_weight,
+    weight_t* cl_reduce,
+    int my_pe,
+    int n_pes,
+    weight_t* Q,
+    weight_t* Q_sum
+)
+{
+    cg::grid_group grid = cg::this_grid();
+    cg::thread_block block = cg::this_thread_block();
+    auto tile32 = cg::tiled_partition<32>(block);
+
+    if (grid.thread_rank() == 0) {
+        cl_reduce[0] = 0.; cl_reduce[1] = 0.; cl_reduce[2] = 0.; cl_reduce[3] = 0.;
+    }
+    grid.sync();
+
+    weight_t s_qsum = 0.;  // Sum_i cut_i           (raw)
+    weight_t s_qout = 0.;  // Sum_i F(q_out_i)
+    weight_t s_mod  = 0.;  // Sum_i F(q_out_i + q_vis_i)
+    weight_t s_node = 0.;  // Sum_v F(p_vis_v)
+
+    // per-module contributions (each PE owns modules [0, local_vertices))
+    for (vertex_t i = grid.thread_rank(); i < local_vertices; i += grid.num_threads()) {
+        weight_t cut = shared_device_community_q_out[i];
+        weight_t vol = shared_device_community_weight[i];
+        s_qsum += cut;
+        s_qout += plogp(cut / mass);
+        s_mod  += plogp((cut + vol) / mass);
+    }
+    // per-node contributions (partition independent within a phase)
+    for (vertex_t v = grid.thread_rank(); v < local_vertices; v += grid.num_threads()) {
+        s_node += plogp(private_device_vertex_weight[v] / mass);
+    }
+
+    s_qsum = cg::reduce(tile32, s_qsum, cg::plus<weight_t>());
+    s_qout = cg::reduce(tile32, s_qout, cg::plus<weight_t>());
+    s_mod  = cg::reduce(tile32, s_mod,  cg::plus<weight_t>());
+    s_node = cg::reduce(tile32, s_node, cg::plus<weight_t>());
+    if (tile32.thread_rank() == 0) {
+        atomicAdd(cl_reduce + 0, s_qsum);
+        atomicAdd(cl_reduce + 1, s_qout);
+        atomicAdd(cl_reduce + 2, s_mod);
+        atomicAdd(cl_reduce + 3, s_node);
+    }
+    grid.sync();
+
+    // all-reduce the 4 partials across PEs
+    if (block.group_index().x == 0 && tile32.meta_group_rank() == 0) {
+        nvshmemx_double_sum_reduce_warp(NVSHMEM_TEAM_WORLD, cl_reduce, cl_reduce, 4);
+    }
+    grid.sync();
+
+    if (grid.thread_rank() == 0) {
+        weight_t q_raw = cl_reduce[0];
+        weight_t Qp    = q_raw / mass;
+        weight_t L     = plogp(Qp) - 2.0 * cl_reduce[1] - cl_reduce[3] + cl_reduce[2];
+        Q[0]     = -L;      // score: the driver maximises this (== minimising L)
+        Q_sum[0] =  q_raw;  // raw Sum_i cut_i, read by the gain kernels
+    }
+    grid.sync();
+}
+
+// NOTE: compute_modularity below is the original objective and is no longer
+// called on the version-2 path (superseded by compute_codelength); kept for
+// reference / the Objective::Modularity template instantiation.
 __global__ void __launch_bounds__(1024, 1)
 compute_modularity(
     weight_t mass,
@@ -412,6 +692,8 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
     vertex_t* shared_device_community_ids_new_,
     vertex_t* shared_device_community_ids,
     weight_t* shared_device_community_weight,
+    weight_t* shared_device_community_q_out,
+    weight_t* Q_sum,
     weight_t mass,
     int my_pe,
     int n_pes,
@@ -442,6 +724,8 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
     weight_t best_modularity;
     weight_t aci;
     weight_t acj;
+    weight_t qout_m;
+    weight_t qout_n;
     int pe_dst;
     vertex_t neighbor_id;
 
@@ -452,6 +736,7 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
     long long unsigned int tmp;
 
     mass = mass / 2.0;
+    weight_t q_total = Q_sum[0];
 
     // dynamic shared memory, |hash| = (512 / TILE_THREADS) * hash_len_tile = 512
     extern  __shared__ unsigned char shared_memory[];
@@ -484,8 +769,10 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
             locating_vertex(pe_dst, dst_community_id, private_device_part_vertex_offset, n_pes);
             if (pe_dst == my_pe) {
                 aci = shared_device_community_weight[dst_community_id];
+                qout_m = shared_device_community_q_out[dst_community_id];
             } else {
                 aci = nvshmem_double_g(shared_device_community_weight + dst_community_id, pe_dst);
+                qout_m = nvshmem_double_g(shared_device_community_q_out + dst_community_id, pe_dst);
             }
         }
 
@@ -493,6 +780,7 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
 
         aci = tile.shfl(aci, 0);  // broadcast aci
         aci -= ki;
+        qout_m = tile.shfl(qout_m, 0);  // broadcast qout_m
 
         for (e = edge_lb + tile.thread_rank(); e < edge_rb; e += TILE_THREADS) {
             neighbor_id = private_device_edge[e];
@@ -534,13 +822,13 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
                 locating_vertex(pe_dst, old_tmp, private_device_part_vertex_offset, n_pes);
                 if (pe_dst == my_pe) {
                     acj = shared_device_community_weight[old_tmp];
+                    qout_n = shared_device_community_q_out[old_tmp];
                 } else {
                     acj = nvshmem_double_g(shared_device_community_weight + old_tmp, pe_dst);
+                    qout_n = nvshmem_double_g(shared_device_community_q_out + old_tmp, pe_dst);
                 }
 
-                wij = hash_table_value[e];
-                wij -= (eici - ki * (aci - acj) / (2. * mass));
-                wij /= mass;
+                wij = move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
                 if (up_down) {
                     if ( (wij > best_modularity) || (wij == best_modularity && src_community_id < dst_community_id) ) {
                         dst_community_id = src_community_id;
@@ -599,6 +887,8 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
     vertex_t* shared_device_community_ids_new_,
     vertex_t* shared_device_community_ids,
     weight_t* shared_device_community_weight,
+    weight_t* shared_device_community_q_out,
+    weight_t* Q_sum,
     weight_t mass,
     int my_pe,
     int n_pes,
@@ -628,13 +918,16 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
     weight_t best_modularity = 0.0;
     weight_t aci;
     weight_t acj;
+    weight_t qout_m;
+    weight_t qout_n;
     int pe_dst;
     long long unsigned int tmp;
     mass = mass / 2.0;
+    weight_t q_total = Q_sum[0];
 
     __shared__ vertex_t hash_table_key[HASH_LEN];
     __shared__ weight_t hash_table_value[HASH_LEN];
-    __shared__ weight_t reduce_buffer[2];
+    __shared__ weight_t reduce_buffer[3];
 
     for (e = block.thread_rank(); e < HASH_LEN; e += block.num_threads()) {
         hash_table_key[e] = UINT32_MAX;
@@ -654,11 +947,14 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
         locating_vertex(pe_dst, dst_community_id, private_device_part_vertex_offset, n_pes);
         if (pe_dst == my_pe) {
             aci = shared_device_community_weight[dst_community_id];
+            qout_m = shared_device_community_q_out[dst_community_id];
         } else {
             aci = nvshmem_double_g(shared_device_community_weight + dst_community_id, pe_dst);
+            qout_m = nvshmem_double_g(shared_device_community_q_out + dst_community_id, pe_dst);
         }
         reduce_buffer[0] = aci;     // write result into shared memory which is visible to all threads within a block
         reduce_buffer[1] = 0.;
+        reduce_buffer[2] = qout_m;
     }
 
     block.sync();
@@ -666,6 +962,7 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
     // broadcast aci among block
     aci = reduce_buffer[0];
     aci -= ki;
+    qout_m = reduce_buffer[2];
     block.sync();
 
     for (e = private_device_offset[vertex_id] + block.thread_rank(); e < private_device_offset[vertex_id + 1]; e += block.num_threads()) {
@@ -714,14 +1011,14 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
             locating_vertex(pe_dst, old_tmp, private_device_part_vertex_offset, n_pes);
             if (pe_dst == my_pe) {
                 acj = shared_device_community_weight[old_tmp];
+                qout_n = shared_device_community_q_out[old_tmp];
             } else {
                 acj = nvshmem_double_g(shared_device_community_weight + old_tmp, pe_dst);
+                qout_n = nvshmem_double_g(shared_device_community_q_out + old_tmp, pe_dst);
             }
 
-            wij = hash_table_value[e];
-            wij -= (eici - ki * (aci - acj) / (2. * mass));
-            wij /= mass;
-            // Add a constraint: when the best modularity is the same, choose the one with the smallest ID.
+            wij = move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
+            // Add a constraint: when the best score is the same, choose the one with the smallest ID.
             if (up_down) {
                 if ( (wij > best_modularity) || (wij == best_modularity && src_community_id < dst_community_id) ) {
                     dst_community_id = src_community_id;
@@ -818,6 +1115,8 @@ calculate_eicj_and_move_vertex_gl_bk(
     vertex_t* shared_device_community_ids_new_,
     vertex_t* shared_device_community_ids,
     weight_t* shared_device_community_weight,
+    weight_t* shared_device_community_q_out,
+    weight_t* Q_sum,
     vertex_t* hash_table_key,
     weight_t* hash_table_value,
     weight_t mass,
@@ -850,9 +1149,12 @@ calculate_eicj_and_move_vertex_gl_bk(
     weight_t best_modularity = 0.0;
     weight_t aci;
     weight_t acj;
+    weight_t qout_m;
+    weight_t qout_n;
     int pe_dst;
     long long unsigned int tmp;
     mass = mass / 2.0;
+    weight_t q_total = Q_sum[0];
 
     __shared__ vertex_t buffer_int[1024/32];
     __shared__ weight_t buffer_double[1024/32];
@@ -881,16 +1183,20 @@ calculate_eicj_and_move_vertex_gl_bk(
             locating_vertex(pe_dst, dst_community_id, private_device_part_vertex_offset, n_pes);
             if (pe_dst == my_pe) {
                 aci = shared_device_community_weight[dst_community_id];
+                qout_m = shared_device_community_q_out[dst_community_id];
             } else {
                 aci = nvshmem_double_g(shared_device_community_weight + dst_community_id, pe_dst);
+                qout_m = nvshmem_double_g(shared_device_community_q_out + dst_community_id, pe_dst);
             }
             buffer_double[0] = aci;     // write result into shared memory which is visible to all threads within a block
             buffer_double[1] = 0.;
+            buffer_double[2] = qout_m;
         }
         block.sync();
 
         aci = buffer_double[0];
         aci -= ki;
+        qout_m = buffer_double[2];
         block.sync();
 
         for (e = private_device_offset[vertex_id] + block.thread_rank(); e < private_device_offset[vertex_id + 1]; e += block.num_threads()) {
@@ -939,14 +1245,14 @@ calculate_eicj_and_move_vertex_gl_bk(
                 locating_vertex(pe_dst, old_tmp, private_device_part_vertex_offset, n_pes);
                 if (pe_dst == my_pe) {
                     acj = shared_device_community_weight[old_tmp];
+                    qout_n = shared_device_community_q_out[old_tmp];
                 } else {
                     acj = nvshmem_double_g(shared_device_community_weight + old_tmp, pe_dst);
+                    qout_n = nvshmem_double_g(shared_device_community_q_out + old_tmp, pe_dst);
                 }
 
-                wij = hash_table_value[e];
-                wij -= (eici - ki * (aci - acj) / (2. * mass));
-                wij /= mass;
-                // Add a constraint: when the best modularity is the same, choose the one with the smallest ID.
+                wij = move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
+                // Add a constraint: when the best score is the same, choose the one with the smallest ID.
                 if (up_down) {
                     if ( (wij > best_modularity) || (wij == best_modularity && src_community_id < dst_community_id) ) {
                         dst_community_id = src_community_id;
@@ -1040,6 +1346,8 @@ void calculate_eicj_and_move_vertex_bin(
     vertex_t* shared_device_community_ids_new,
     vertex_t* shared_device_community_ids,
     weight_t* shared_device_community_weight,
+    weight_t* shared_device_community_q_out,
+    weight_t* Q_sum,
     weight_t mass,
     int my_pe,
     int n_pes,
@@ -1064,88 +1372,56 @@ void calculate_eicj_and_move_vertex_bin(
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 2);
                     d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
-                    calculate_eicj_and_move_vertex_sh_tile<2><<<grid_num, block_num, d_shared_mem, streams[0]>>>(begin_vertex_id,
-                                                                                                                    private_device_offset,
-                                                                                                                    private_device_edge,
-                                                                                                                    private_device_edge_weight,
-                                                                                                                    private_device_vertex_weight,
-                                                                                                                    private_device_part_vertex_offset,
-                                                                                                                    shared_device_community_ids_new,
-                                                                                                                    shared_device_community_ids,
-                                                                                                                    shared_device_community_weight,
-                                                                                                                    mass,
-                                                                                                                    my_pe,
-                                                                                                                    n_pes,
-                                                                                                                    up_down,
-                                                                                                                    bins->bin_size[i],
-                                                                                                                    bins->bin_offset[i],
-                                                                                                                    bins->device_bin_permutation);
+                    calculate_eicj_and_move_vertex_sh_tile<2><<<grid_num, block_num, d_shared_mem, streams[0]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
                     break;
                 case 1:
                     // tile4 for a vertex whose #edges is less than 4
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 4);
                     d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
-                    calculate_eicj_and_move_vertex_sh_tile<4><<<grid_num, block_num, d_shared_mem, streams[1]>>>(begin_vertex_id,
-                                                                                                                     private_device_offset,
-                                                                                                                     private_device_edge,
-                                                                                                                     private_device_edge_weight,
-                                                                                                                     private_device_vertex_weight,
-                                                                                                                     private_device_part_vertex_offset,
-                                                                                                                     shared_device_community_ids_new,
-                                                                                                                     shared_device_community_ids,
-                                                                                                                     shared_device_community_weight,
-                                                                                                                     mass,
-                                                                                                                     my_pe,
-                                                                                                                     n_pes,
-                                                                                                                     up_down,
-                                                                                                                     bins->bin_size[i],
-                                                                                                                     bins->bin_offset[i],
-                                                                                                                     bins->device_bin_permutation);
+                    calculate_eicj_and_move_vertex_sh_tile<4><<<grid_num, block_num, d_shared_mem, streams[1]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
                     break;
                 case 2:
                     // tile8 for a vertex whose #edges is less than 8
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 8);
                     d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
-                    calculate_eicj_and_move_vertex_sh_tile<8><<<grid_num, block_num, d_shared_mem, streams[2]>>>(begin_vertex_id,
-                                                                                                                     private_device_offset,
-                                                                                                                     private_device_edge,
-                                                                                                                     private_device_edge_weight,
-                                                                                                                     private_device_vertex_weight,
-                                                                                                                     private_device_part_vertex_offset,
-                                                                                                                     shared_device_community_ids_new,
-                                                                                                                     shared_device_community_ids,
-                                                                                                                     shared_device_community_weight,
-                                                                                                                     mass,
-                                                                                                                     my_pe,
-                                                                                                                     n_pes,
-                                                                                                                     up_down,
-                                                                                                                     bins->bin_size[i],
-                                                                                                                     bins->bin_offset[i],
-                                                                                                                     bins->device_bin_permutation);
+                    calculate_eicj_and_move_vertex_sh_tile<8><<<grid_num, block_num, d_shared_mem, streams[2]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
                     break;
                 case 3:
                     // tile16 for a vertex whose #edges is less than 16
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 16);
                     d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
-                    calculate_eicj_and_move_vertex_sh_tile<16><<<grid_num, block_num, d_shared_mem, streams[3]>>>(begin_vertex_id,
-                                                                                                                     private_device_offset,
-                                                                                                                     private_device_edge,
-                                                                                                                     private_device_edge_weight,
-                                                                                                                     private_device_vertex_weight,
-                                                                                                                     private_device_part_vertex_offset,
-                                                                                                                     shared_device_community_ids_new,
-                                                                                                                     shared_device_community_ids,
-                                                                                                                     shared_device_community_weight,
-                                                                                                                     mass,
-                                                                                                                     my_pe,
-                                                                                                                     n_pes,
-                                                                                                                     up_down,
-                                                                                                                     bins->bin_size[i],
-                                                                                                                     bins->bin_offset[i],
-                                                                                                                     bins->device_bin_permutation);
+                    calculate_eicj_and_move_vertex_sh_tile<16><<<grid_num, block_num, d_shared_mem, streams[3]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
                     break;
 
                 case 4:
@@ -1153,106 +1429,66 @@ void calculate_eicj_and_move_vertex_bin(
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 32);
                     d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
-                    calculate_eicj_and_move_vertex_sh_tile<32><<<grid_num, block_num, d_shared_mem, streams[4]>>>(begin_vertex_id,
-                                                                                                                      private_device_offset,
-                                                                                                                      private_device_edge,
-                                                                                                                      private_device_edge_weight,
-                                                                                                                      private_device_vertex_weight,
-                                                                                                                      private_device_part_vertex_offset,
-                                                                                                                      shared_device_community_ids_new,
-                                                                                                                      shared_device_community_ids,
-                                                                                                                      shared_device_community_weight,
-                                                                                                                      mass,
-                                                                                                                      my_pe,
-                                                                                                                      n_pes,
-                                                                                                                      up_down,
-                                                                                                                      bins->bin_size[i],
-                                                                                                                      bins->bin_offset[i],
-                                                                                                                      bins->device_bin_permutation);
+                    calculate_eicj_and_move_vertex_sh_tile<32><<<grid_num, block_num, d_shared_mem, streams[4]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
                     break;
                 case 5:
                     block_num = 128;
                     grid_num = bins->bin_size[i];
-                    calculate_eicj_and_move_vertex_sh_bk<128><<<grid_num, block_num, 0, streams[5]>>>(begin_vertex_id,
-                                                                                                          private_device_offset,
-                                                                                                          private_device_edge,
-                                                                                                          private_device_edge_weight,
-                                                                                                          private_device_vertex_weight,
-                                                                                                          private_device_part_vertex_offset,
-                                                                                                          shared_device_community_ids_new,
-                                                                                                          shared_device_community_ids,
-                                                                                                          shared_device_community_weight,
-                                                                                                          mass,
-                                                                                                          my_pe,
-                                                                                                          n_pes,
-                                                                                                          up_down,
-                                                                                                          bins->bin_size[i],
-                                                                                                          bins->bin_offset[i],
-                                                                                                          bins->device_bin_permutation,
-                                                                                                          total_vertices);
+                    calculate_eicj_and_move_vertex_sh_bk<128><<<grid_num, block_num, 0, streams[5]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            total_vertices);
                     break;
                 case 6:
                     block_num = 512;
                     grid_num = bins->bin_size[i];
-                    calculate_eicj_and_move_vertex_sh_bk<512><<<grid_num, block_num, 0, streams[6]>>>(begin_vertex_id,
-                                                                                                          private_device_offset,
-                                                                                                          private_device_edge,
-                                                                                                          private_device_edge_weight,
-                                                                                                          private_device_vertex_weight,
-                                                                                                          private_device_part_vertex_offset,
-                                                                                                          shared_device_community_ids_new,
-                                                                                                          shared_device_community_ids,
-                                                                                                          shared_device_community_weight,
-                                                                                                          mass,
-                                                                                                          my_pe,
-                                                                                                          n_pes,
-                                                                                                          up_down,
-                                                                                                          bins->bin_size[i],
-                                                                                                          bins->bin_offset[i],
-                                                                                                          bins->device_bin_permutation,
-                                                                                                          total_vertices);
+                    calculate_eicj_and_move_vertex_sh_bk<512><<<grid_num, block_num, 0, streams[6]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            total_vertices);
                     break;
                 case 7:
                     block_num = 1024;
                     grid_num = bins->bin_size[i];
-                    calculate_eicj_and_move_vertex_sh_bk<2048><<<grid_num, block_num, 0, streams[7]>>>(begin_vertex_id,
-                                                                                                           private_device_offset,
-                                                                                                           private_device_edge,
-                                                                                                           private_device_edge_weight,
-                                                                                                           private_device_vertex_weight,
-                                                                                                           private_device_part_vertex_offset,
-                                                                                                           shared_device_community_ids_new,
-                                                                                                           shared_device_community_ids,
-                                                                                                           shared_device_community_weight,
-                                                                                                           mass,
-                                                                                                           my_pe,
-                                                                                                           n_pes,
-                                                                                                           up_down,
-                                                                                                           bins->bin_size[i],
-                                                                                                           bins->bin_offset[i],
-                                                                                                           bins->device_bin_permutation,
-                                                                                                           total_vertices);
+                    calculate_eicj_and_move_vertex_sh_bk<2048><<<grid_num, block_num, 0, streams[7]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            total_vertices);
                     break;
                 case 8:
                     block_num = 1024;
                     grid_num = bins->bin_size[i];
-                    calculate_eicj_and_move_vertex_sh_bk<4094><<<grid_num, block_num, 0, streams[8]>>>(begin_vertex_id,
-                                                                                                           private_device_offset,
-                                                                                                           private_device_edge,
-                                                                                                           private_device_edge_weight,
-                                                                                                           private_device_vertex_weight,
-                                                                                                           private_device_part_vertex_offset,
-                                                                                                           shared_device_community_ids_new,
-                                                                                                           shared_device_community_ids,
-                                                                                                           shared_device_community_weight,
-                                                                                                           mass,
-                                                                                                           my_pe,
-                                                                                                           n_pes,
-                                                                                                           up_down,
-                                                                                                           bins->bin_size[i],
-                                                                                                           bins->bin_offset[i],
-                                                                                                           bins->device_bin_permutation,
-                                                                                                           total_vertices);
+                    calculate_eicj_and_move_vertex_sh_bk<4094><<<grid_num, block_num, 0, streams[8]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            total_vertices);
                     break;
                 case 9:
                     int SMs = 80;
@@ -1263,25 +1499,16 @@ void calculate_eicj_and_move_vertex_bin(
                     CUDA_RT_CALL(cudaMalloc((void **) &hash_table_value, sizeof(weight_t) * len_hash_table));
                     grid_num = hash_table_num;
                     block_num = 1024;
-                    calculate_eicj_and_move_vertex_gl_bk<<<grid_num, block_num, 0, streams[9]>>>(begin_vertex_id,
-                                                                                                     private_device_offset,
-                                                                                                     private_device_edge,
-                                                                                                     private_device_edge_weight,
-                                                                                                     private_device_vertex_weight,
-                                                                                                     private_device_part_vertex_offset,
-                                                                                                     shared_device_community_ids_new,
-                                                                                                     shared_device_community_ids,
-                                                                                                     shared_device_community_weight,
-                                                                                                     hash_table_key,
-                                                                                                     hash_table_value,
-                                                                                                     mass,
-                                                                                                     my_pe,
-                                                                                                     n_pes,
-                                                                                                     up_down,
-                                                                                                     bins->bin_size[i],
-                                                                                                     bins->bin_offset[i],
-                                                                                                     bins->device_bin_permutation,
-                                                                                                     max_degree);
+                    calculate_eicj_and_move_vertex_gl_bk<<<grid_num, block_num, 0, streams[9]>>>(
+                            begin_vertex_id,
+                            private_device_offset, private_device_edge, private_device_edge_weight,
+                            private_device_vertex_weight, private_device_part_vertex_offset,
+                            shared_device_community_ids_new, shared_device_community_ids,
+                            shared_device_community_weight, shared_device_community_q_out, Q_sum,
+                            hash_table_key, hash_table_value,
+                            mass, my_pe, n_pes, up_down,
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            max_degree);
                     break;
             }
         }
@@ -1398,6 +1625,77 @@ compute_community_weight(
 }
 
 
+namespace louvain {
+// Launch the three map-equation kernels that score a partition: compute the
+// per-module exit weights (q_out) for `community_ids`, then assemble the
+// codelength, writing score = -L into Q and the raw exit sum into Q_sum.
+// `q_out_delta` is total_vertices doubles of scratch (the community delta array
+// is reused between loop iterations).
+static void launch_compute_codelength(
+    weight_t mass,
+    vertex_t local_vertices,
+    vertex_t total_vertices,
+    vertex_t* private_device_offset,
+    edge_t* private_device_edge,
+    weight_t* private_device_edge_weight,
+    vertex_t* private_device_part_vertex_offset,
+    vertex_t* community_ids,
+    weight_t* shared_device_community_weight,
+    weight_t* shared_device_community_q_out,
+    weight_t* q_out_delta,
+    weight_t* private_device_vertex_weight,
+    weight_t* cl_reduce,
+    weight_t* Q,
+    weight_t* Q_sum,
+    int my_pe,
+    int n_pes,
+    int block_dims,
+    size_t d_shared_mem,
+    cudaStream_t default_stream)
+{
+    int grid_size = 0;
+
+    // 1) per-PE partial exit weights into q_out_delta (indexed by global module)
+    void *a1[] = {
+            (void *) &local_vertices, (void *) &total_vertices,
+            (void *) &private_device_offset, (void *) &private_device_edge,
+            (void *) &private_device_edge_weight, (void *) &private_device_part_vertex_offset,
+            (void *) &community_ids, (void *) &q_out_delta,
+            (void *) &my_pe, (void *) &n_pes
+    };
+    NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_community_q_out_local_atomic, block_dims, a1, d_shared_mem, &grid_size));
+    nvshmem_barrier_all();
+    NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_q_out_local_atomic, grid_size, block_dims, a1, d_shared_mem, default_stream));
+    nvshmemx_barrier_all_on_stream(default_stream);
+    CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
+    // 2) reduce partials across PEs into the owning PE's q_out
+    void *a2[] = {
+            (void *) &local_vertices, (void *) &total_vertices,
+            (void *) &shared_device_community_q_out, (void *) &q_out_delta,
+            (void *) &private_device_part_vertex_offset, (void *) &my_pe, (void *) &n_pes
+    };
+    NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_community_q_out, block_dims, a2, d_shared_mem, &grid_size));
+    nvshmem_barrier_all();
+    NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_q_out, grid_size, block_dims, a2, d_shared_mem, default_stream));
+    nvshmemx_barrier_all_on_stream(default_stream);
+    CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
+    // 3) assemble codelength -> Q (= -L), Q_sum (= raw Sum_i cut_i)
+    void *a3[] = {
+            (void *) &mass, (void *) &local_vertices,
+            (void *) &shared_device_community_weight, (void *) &shared_device_community_q_out,
+            (void *) &private_device_vertex_weight, (void *) &cl_reduce,
+            (void *) &my_pe, (void *) &n_pes, (void *) &Q, (void *) &Q_sum
+    };
+    NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_codelength, block_dims, a3, d_shared_mem, &grid_size));
+    nvshmem_barrier_all();
+    NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_codelength, grid_size, block_dims, a3, d_shared_mem, default_stream));
+    nvshmemx_barrier_all_on_stream(default_stream);
+    CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+}
+}  // namespace louvain
+
 void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double threshold, const int max_iter,
                            const int max_phases) {
     int n_pes = nvshmem_n_pes();
@@ -1437,11 +1735,13 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     auto *shared_device_community_delta_weight = gpuGraph->get_shared_device_community_delta_weight_();
     auto *shared_device_community_ids = gpuGraph->get_shared_device_community_ids_();
     auto *shared_device_community_ids_new = gpuGraph->get_shared_device_community_ids_new_();
-    auto *Q = (weight_t *) nvshmem_malloc(sizeof(weight_t));
+    auto *shared_device_community_q_out = gpuGraph->get_shared_device_community_q_out_();
+    auto *Q = (weight_t *) nvshmem_malloc(sizeof(weight_t));        // score = -L (maximised)
     CUDA_RT_CALL(cudaMemset(Q, 0, sizeof(weight_t)));
-    auto *shared_sum_community_weight = (weight_t *)nvshmem_malloc(sizeof(weight_t));
-    CUDA_RT_CALL(cudaMemset(shared_sum_community_weight, 0, sizeof(weight_t)));
-    auto *shared_sum_internal_edge_weight = (weight_t *)nvshmem_malloc(sizeof(weight_t));
+    auto *Q_sum = (weight_t *) nvshmem_malloc(sizeof(weight_t));    // raw Sum_i cut_i, read by gain kernels
+    CUDA_RT_CALL(cudaMemset(Q_sum, 0, sizeof(weight_t)));
+    auto *cl_reduce = (weight_t *) nvshmem_malloc(4 * sizeof(weight_t));   // codelength reduction scratch
+    CUDA_RT_CALL(cudaMemset(cl_reduce, 0, 4 * sizeof(weight_t)));
 
     int block_dims = 1024;
     int grid_size = 0;
@@ -1472,9 +1772,9 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     start_total = MPI_Wtime();
     while (phase_num < max_phases && (Q_host - Q_old_host) > threshold) {
 
-        Q_old_host = Q_host;
         weight_t new_Q;
         weight_t cur_Q;
+        weight_t phase_initial_score;   // codelength score (-L) at the start of this phase
         vertex_t begin_vertex_id = part_vertex_offset[my_pe];
         vertex_t end_vertex_id = part_vertex_offset[my_pe + 1];
 
@@ -1504,38 +1804,23 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
 
-        // 3. Compute the modularity of this phase
-        // use NVSHMEM collective operation, need 'nvshmemx_collective_launch' to launch kernel
-        void *kernel_args[] = {
-                (void *) &mass,
-                (void *) &local_vertices,
-                (void *) &private_device_offset,
-                (void *) &private_device_edge,
-                (void *) &private_device_edge_weight,
-                (void *) &private_device_part_vertex_offset,
-                (void *) &shared_device_community_ids,
-                (void *) &shared_device_community_weight,
-                (void *) &shared_sum_community_weight,
-                (void *) &shared_sum_internal_edge_weight,
-                (void *) &my_pe,
-                (void *) &n_pes,
-                (void *) &Q
-        };
-        NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_modularity, block_dims, kernel_args, d_shared_mem, &grid_size));
-        nvshmem_barrier_all();
-
-        NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_modularity, grid_size, block_dims, kernel_args, d_shared_mem, default_stream));
-        nvshmemx_barrier_all_on_stream(default_stream);
-        CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+        // 3. Compute the initial codelength score (-L) of this phase
+        launch_compute_codelength(mass, local_vertices, total_vertices,
+                                  private_device_offset, private_device_edge, private_device_edge_weight,
+                                  private_device_part_vertex_offset, shared_device_community_ids,
+                                  shared_device_community_weight, shared_device_community_q_out,
+                                  shared_device_community_delta_weight, private_device_vertex_weight,
+                                  cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream);
 
         CUDA_RT_CALL(cudaMemcpy(&new_Q, Q, sizeof(weight_t) , cudaMemcpyDeviceToHost));
 
         cur_Q = new_Q - 1;
+        phase_initial_score = new_Q;
 
         if(my_pe == 0) {
-            printf("| %-10s | %-10s | %-10s | %-10s | %-10s |\n", "Loop", "Q", "dQ", "time(s)", "time(ms)");
+            printf("| %-10s | %-10s | %-10s | %-10s | %-10s |\n", "Loop", "L(bits)", "dL", "time(s)", "time(ms)");
             printf("|------------|------------|------------|------------|------------|\n");
-            printf("| %-10d | %-10f | %-10f | %-10f | %-10f |\n", 0, new_Q, 0., 0., 0.);
+            printf("| %-10d | %-10f | %-10f | %-10f | %-10f |\n", 0, -new_Q, 0., 0., 0.);
         }
 
         bool up_down = true;
@@ -1563,6 +1848,8 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                 shared_device_community_ids_new,
                                                 shared_device_community_ids,
                                                 shared_device_community_weight,
+                                                shared_device_community_q_out,
+                                                Q_sum,
                                                 mass,
                                                 my_pe,
                                                 n_pes,
@@ -1612,27 +1899,13 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
             update_weight_time += (stop_in_loop - start_in_loop);
             start_in_loop = MPI_Wtime();
 
-            // c) compute modularity
-            void *kernel_args_cm[] = {
-                    (void *) &mass,
-                    (void *) &local_vertices,
-                    (void *) &private_device_offset,
-                    (void *) &private_device_edge,
-                    (void *) &private_device_edge_weight,
-                    (void *) &private_device_part_vertex_offset,
-                    (void *) &shared_device_community_ids_new,
-                    (void *) &shared_device_community_weight,
-                    (void *) &shared_sum_community_weight,
-                    (void *) &shared_sum_internal_edge_weight,
-                    (void *) &my_pe,
-                    (void *) &n_pes,
-                    (void *) &Q
-            };
-            NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_modularity, block_dims, kernel_args_cm, d_shared_mem, &grid_size));
-            nvshmem_barrier_all();
-            NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_modularity, grid_size, block_dims, kernel_args_cm, d_shared_mem, default_stream));
-            nvshmemx_barrier_all_on_stream(default_stream);
-            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+            // c) compute the new codelength score (-L) for the proposed partition
+            launch_compute_codelength(mass, local_vertices, total_vertices,
+                                      private_device_offset, private_device_edge, private_device_edge_weight,
+                                      private_device_part_vertex_offset, shared_device_community_ids_new,
+                                      shared_device_community_weight, shared_device_community_q_out,
+                                      shared_device_community_delta_weight, private_device_vertex_weight,
+                                      cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream);
 
             stop_in_loop = MPI_Wtime();
             compute_modularity_time += (stop_in_loop - start_in_loop);
@@ -1651,7 +1924,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
             loop_num++;
             stop = MPI_Wtime();
             if(my_pe == 0){
-                printf("| %-10d | %-10f | %-10f | %-10f | %-10f |\n", loop_num, new_Q, (new_Q - cur_Q), (stop - start), (stop - start) * 1000);
+                printf("| %-10d | %-10f | %-10f | %-10f | %-10f |\n", loop_num, -new_Q, -(new_Q - cur_Q), (stop - start), (stop - start) * 1000);
             }
             loop_time += (stop - start) * 1000;
             nvshmem_barrier_all();
@@ -1671,6 +1944,11 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
             printf("The average execution time per loop: %f s, %f ms\n", loop_time / 1000, loop_time);
         }
 
+        // The map-equation codelength is not invariant across coarsening (the
+        // per-node entropy term changes level to level), so phase continuation is
+        // driven by this phase's own improvement (final vs. initial score) rather
+        // than by comparing scores across levels. For modularity these are equal.
+        Q_old_host = phase_initial_score;
         Q_host = new_Q;
         if ((Q_host - Q_old_host) <= threshold) break;
 
@@ -1710,7 +1988,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 //        printf("Total loops: %d\n", loop_total);
     }
     nvshmem_free(Q);
-    nvshmem_free(shared_sum_community_weight);
-    nvshmem_free(shared_sum_internal_edge_weight);
+    nvshmem_free(Q_sum);
+    nvshmem_free(cl_reduce);
 }
 

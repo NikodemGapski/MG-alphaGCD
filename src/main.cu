@@ -82,7 +82,9 @@ int main(int argc, char* argv[]){
     auto total_vertices = hostGraph->get_total_vertices_();
     auto total_edges = hostGraph->get_total_edge_();
     edge_t len_edge_array = total_edges / local_size + (total_edges % local_size != 0) + total_vertices;
-    long long unsigned int required_symmetric_heap_size = sizeof(vertex_t) * (4 * total_vertices + len_edge_array + 1) + sizeof(weight_t) * (2 * total_vertices + len_edge_array + 3);
+    // weight_t arrays: community_weight, community_delta_weight, community_q_out (3 * total_vertices)
+    // + edge weights (len_edge_array) + codelength scalars (Q score, Q_sum, 4-elem reduce buffer, margin)
+    long long unsigned int required_symmetric_heap_size = sizeof(vertex_t) * (4 * total_vertices + len_edge_array + 1) + sizeof(weight_t) * (3 * total_vertices + len_edge_array + 8);
     char *value = getenv("NVSHMEM_SYMMETRIC_SIZE");
     if (value) { /* env variable is set */
         long long unsigned int size_env = parse_nvshmem_symmetric_size(value);

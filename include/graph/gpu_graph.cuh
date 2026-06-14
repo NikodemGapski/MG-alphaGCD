@@ -22,6 +22,7 @@ private:
     // shared
     weight_t* shared_device_community_weight_;
     weight_t* shared_device_community_delta_weight_;
+    weight_t* shared_device_community_q_out_;        /* Map equation: per-module exit (cut) weight, raw units */
     vertex_t* shared_device_community_ids_;
     vertex_t* shared_device_community_ids_new_;
 
@@ -37,6 +38,7 @@ public:
 
         nvshmem_free(shared_device_community_weight_);
         nvshmem_free(shared_device_community_delta_weight_);
+        nvshmem_free(shared_device_community_q_out_);
         nvshmem_free(shared_device_community_ids_);
         nvshmem_free(shared_device_community_ids_new_);
     }
@@ -56,6 +58,7 @@ public:
     vertex_t* get_shared_device_community_ids_new_();
     weight_t* get_shared_device_community_weight_();
     weight_t* get_shared_device_community_delta_weight_();
+    weight_t* get_shared_device_community_q_out_();
 
     vertex_t get_total_vertices_();
     edge_t get_total_edges_();
