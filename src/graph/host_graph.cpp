@@ -1,10 +1,23 @@
 #include "../../include/graph/host_graph.h"
 
-HostGraph::HostGraph(char *graph_path, int my_pe):
+HostGraph::HostGraph(char *graph_path, int my_pe, bool directed):
 total_vertices_(0), total_edge_(0), host_offset_(nullptr),
-host_edge_(nullptr), host_edge_weight_(nullptr), mass_(0)
+host_edge_(nullptr), host_edge_weight_(nullptr), mass_(0),
+host_in_offset_(nullptr), host_in_edge_(nullptr), host_in_edge_weight_(nullptr),
+host_s_out_(nullptr), total_in_edge_(0), directed_(directed)
 {
-    load_graph_mtx(graph_path);
+    if (directed_) {
+        // Use the directed loader: keeps edges as-is, builds in-CSR and s_out.
+        edge_t nnz_in;
+        loadMMDirectedSparseMatrix(graph_path,
+            &total_vertices_,
+            &host_offset_, &host_edge_, &host_edge_weight_, &total_edge_,
+            &host_in_offset_, &host_in_edge_, &host_in_edge_weight_, &nnz_in,
+            &host_s_out_);
+        total_in_edge_ = nnz_in;
+    } else {
+        load_graph_mtx(graph_path);
+    }
     if (my_pe == 0) {
         std::cout << std::setfill('-') << std::setw(3 * 25) << "" << std::setfill(' ') << std::endl;
         std::cout << std::setw(25) << "Input graph" << std::setw(25) << "Num. vertices (n)" << std::setw(25) << "Num. edges (M)" << std::endl;
@@ -16,7 +29,9 @@ host_edge_(nullptr), host_edge_weight_(nullptr), mass_(0)
 
 HostGraph::HostGraph(int random_vertex_num, double sparsity, int my_pe):
 total_vertices_(random_vertex_num), total_edge_(0), host_offset_(nullptr),
-host_edge_(nullptr), host_edge_weight_(nullptr), mass_(0)
+host_edge_(nullptr), host_edge_weight_(nullptr), mass_(0),
+host_in_offset_(nullptr), host_in_edge_(nullptr), host_in_edge_weight_(nullptr),
+host_s_out_(nullptr), total_in_edge_(0), directed_(false)
 {
     randomly_generate_graph(random_vertex_num, sparsity);
     if (my_pe == 0) {

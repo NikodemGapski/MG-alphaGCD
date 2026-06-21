@@ -85,6 +85,62 @@ void edge_partition::partitioner(HostGraph *hostGraph, GpuGraph* gpuGraph, int n
     sub_first_ele<<<iDivUp((gpuGraph->get_local_vertices_() + 1), 256), 256>>>(device_offset, hostGraph->get_host_offset_()[part_vertex_offset[my_pe]], gpuGraph->get_local_vertices_() + 1);
 
     CUDA_RT_CALL(cudaFree(device_offset_copy));
+
+    // ---- directed-mode: upload in-CSR and s_out for this PE's vertex range ----
+    if (gpuGraph->is_directed_()) {
+        auto *device_in_offset = gpuGraph->get_private_device_in_offset_();
+        edge_t *device_in_edge;
+        weight_t *device_in_edge_weight;
+
+        // Compute max local in-edges across all PEs (mirrors the out-edge logic)
+        edge_t max_local_in_edges = 0;
+        for (int i = 0; i < n_pes; i++) {
+            edge_t local_in_edges_pei =
+                hostGraph->get_host_in_offset_()[part_vertex_offset[i + 1]] -
+                hostGraph->get_host_in_offset_()[part_vertex_offset[i]];
+            if (local_in_edges_pei > max_local_in_edges) max_local_in_edges = local_in_edges_pei;
+        }
+        gpuGraph->set_len_in_edges_array_(max_local_in_edges);
+
+        device_in_edge        = (edge_t *)   nvshmem_malloc(max_local_in_edges * sizeof(edge_t));
+        device_in_edge_weight = (weight_t *) nvshmem_malloc(max_local_in_edges * sizeof(weight_t));
+        CUDA_RT_CALL(cudaMemset(device_in_edge,        0, max_local_in_edges * sizeof(edge_t)));
+        CUDA_RT_CALL(cudaMemset(device_in_edge_weight, 0, max_local_in_edges * sizeof(weight_t)));
+        gpuGraph->set_private_device_in_edge_(device_in_edge);
+        gpuGraph->set_private_device_in_edge_weight_(device_in_edge_weight);
+
+        // Upload the in-CSR offset slice for this PE's vertices
+        vertex_t v_start = part_vertex_offset[my_pe];
+        vertex_t local_v = part_vertex_offset[my_pe + 1] - v_start;
+        CUDA_RT_CALL(cudaMemcpy(device_in_offset,
+            hostGraph->get_host_in_offset_() + v_start,
+            sizeof(vertex_t) * (local_v + 1),
+            cudaMemcpyHostToDevice));
+        // Rebase offsets to start at 0 for this PE's slice
+        sub_first_ele<<<iDivUp(local_v + 1, 256), 256>>>(
+            device_in_offset,
+            hostGraph->get_host_in_offset_()[v_start],
+            local_v + 1);
+
+        // Upload the in-edges and weights for this PE's vertices
+        edge_t in_edge_start  = hostGraph->get_host_in_offset_()[v_start];
+        edge_t local_in_edges = hostGraph->get_host_in_offset_()[part_vertex_offset[my_pe + 1]] - in_edge_start;
+        CUDA_RT_CALL(cudaMemcpy(device_in_edge,
+            hostGraph->get_host_in_edge_() + in_edge_start,
+            sizeof(edge_t) * local_in_edges,
+            cudaMemcpyHostToDevice));
+        CUDA_RT_CALL(cudaMemcpy(device_in_edge_weight,
+            hostGraph->get_host_in_weight_() + in_edge_start,
+            sizeof(weight_t) * local_in_edges,
+            cudaMemcpyHostToDevice));
+
+        // Upload s_out for this PE's vertices (indexed by LOCAL vertex id, starting at 0)
+        auto *device_s_out = gpuGraph->get_private_device_s_out_();
+        CUDA_RT_CALL(cudaMemcpy(device_s_out,
+            hostGraph->get_host_s_out_() + v_start,
+            sizeof(weight_t) * local_v,
+            cudaMemcpyHostToDevice));
+    }
 }
 
 void edge_partition::partitioner_intra_loop(HostGraph *hostGraph, GpuGraph* gpuGraph, int n_pes, int my_pe) {

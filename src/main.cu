@@ -24,6 +24,10 @@ int main(int argc, char* argv[]){
     const int random_vertex_num = get_argval<int>(argv, argv + argc, "-random_vertex_num", RANDOM_VERTEX_NUM);
     const double sparsity = get_argval<double>(argv, argv + argc, "-sparsity", 0.1);
     const int version = get_argval<int>(argv, argv + argc, "-version", 2);
+    // Map equation options: -directed keeps edges as directed (no symmetrize);
+    // -tau sets the PageRank teleportation probability (Infomap default: 0.15).
+    const bool directed = get_arg(argv, argv + argc, "-directed");
+    const double tau = get_argval<double>(argv, argv + argc, "-tau", 0.15);
 
     //----------------------------------------------------------------/
     //------------------------- init nvshmem -------------------------/
@@ -68,7 +72,7 @@ int main(int argc, char* argv[]){
         if (local_rank == 0) {
             printf("loading graph...\n");
         }
-        hostGraph = new HostGraph(path_of_graph, local_rank);
+        hostGraph = new HostGraph(path_of_graph, local_rank, directed);
     }
     hostGraph->compute_total_edge_weight();
 
@@ -85,6 +89,14 @@ int main(int argc, char* argv[]){
     // weight_t arrays: community_weight, community_delta_weight, community_q_out (3 * total_vertices)
     // + edge weights (len_edge_array) + codelength scalars (Q score, Q_sum, 4-elem reduce buffer, margin)
     long long unsigned int required_symmetric_heap_size = sizeof(vertex_t) * (4 * total_vertices + len_edge_array + 1) + sizeof(weight_t) * (3 * total_vertices + len_edge_array + 8);
+    if (directed) {
+        // Directed mode adds in-CSR (offset + edges + weights) and s_out array to the NVSHMEM heap.
+        edge_t total_in_edges = hostGraph->get_total_in_edge_();
+        edge_t len_in_edge_array = total_in_edges / local_size + (total_in_edges % local_size != 0) + total_vertices;
+        required_symmetric_heap_size +=
+            sizeof(vertex_t) * (total_vertices + 1 + len_in_edge_array) +
+            sizeof(weight_t) * (total_vertices + len_in_edge_array);
+    }
     char *value = getenv("NVSHMEM_SYMMETRIC_SIZE");
     if (value) { /* env variable is set */
         long long unsigned int size_env = parse_nvshmem_symmetric_size(value);
@@ -125,7 +137,7 @@ int main(int argc, char* argv[]){
             louvain_gl::run(hostGraph, gpuGraph, threshold, max_iter, max_phases);
             break;
         case 2:
-            louvain::run(hostGraph, gpuGraph, threshold, max_iter, max_phases);
+            louvain::run(hostGraph, gpuGraph, threshold, max_iter, max_phases, tau);
             break;
         default:
             printf("the version is unsupported\n");

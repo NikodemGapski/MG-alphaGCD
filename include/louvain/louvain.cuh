@@ -8,7 +8,9 @@
 #include "../coarsen_graph/coarsen_graph_mg.cuh"
 
 namespace louvain {
-    void run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double threshold, const int max_iter, const int max_phases);
+    // tau: teleportation probability for the map equation random walk (Infomap default 0.15).
+    // tau=0 recovers the undirected closed-form flow and is the current implementation.
+    void run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double threshold, const int max_iter, const int max_phases, const double tau = 0.0);
 };
 
 

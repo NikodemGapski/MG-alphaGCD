@@ -2,6 +2,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unordered_set>
 
 #include "../../include/mmio/mmio_wrapper.h"
@@ -297,5 +298,106 @@ void init_data_from_mtx(char *file_path, vertex_t *&offset, edge_t *&colindex, w
 int loadMMSparseMatrix(char *filename, char elem_type, bool csrFormat, vertex_t *m, vertex_t *n, edge_t *nnz,
                        weight_t **aVal, vertex_t **aRowInd, edge_t **aColInd, int extendSymMatrix) {
     init_data_from_mtx(filename, *aRowInd, *aColInd, *aVal, m, n, nnz);
+    return 0;
+}
+
+// Build out-CSR and in-CSR from a directed (general) MTX file.
+// Self-loops are skipped.  Weights default to 1.0 for pattern matrices.
+// All arrays are heap-allocated with new[]; caller owns them.
+int loadMMDirectedSparseMatrix(
+    char *filename,
+    vertex_t *m,
+    vertex_t **out_offset_p, edge_t **out_edge_p, weight_t **out_weight_p, edge_t *nnz_out,
+    vertex_t **in_offset_p,  edge_t **in_edge_p,  weight_t **in_weight_p,  edge_t *nnz_in,
+    weight_t **s_out_p
+) {
+    int LINE_LENGTH_MAX = 1000;
+    char *line = new char[LINE_LENGTH_MAX];
+    char *ch;
+    FILE *fp = fopen(filename, "r");
+    if (!fp) { printf("Cannot find file: %s\n", filename); exit(1); }
+
+    // read banner
+    fgets(line, LINE_LENGTH_MAX, fp);
+    // skip comment lines
+    while (fgets(line, LINE_LENGTH_MAX, fp) && line[0] == '%') {}
+
+    vertex_t nrow, ncol;
+    edge_t nnz_file;
+    sscanf(line, "%u %u %u", &nrow, &ncol, &nnz_file);
+    *m = nrow;
+
+    // Read edges into COO, skip self-loops
+    vertex_t *row_coo = new vertex_t[nnz_file];
+    vertex_t *col_coo = new vertex_t[nnz_file];
+    weight_t *val_coo = new weight_t[nnz_file];
+    edge_t num = 0;
+
+    while (fgets(line, LINE_LENGTH_MAX, fp)) {
+        ch = line;
+        vertex_t r = (vertex_t)(atoi(ch) - 1);
+        ch = strchr(ch, ' '); ch++;
+        vertex_t c = (vertex_t)(atoi(ch) - 1);
+        ch = strchr(ch, ' ');
+        weight_t w = 1.0;
+        if (ch != NULL) { ch++; w = (weight_t)atof(ch); if (w == 0.0) w = 1.0; }
+        if (r == c) continue;   // skip self-loops
+        row_coo[num] = r;
+        col_coo[num] = c;
+        val_coo[num] = w;
+        num++;
+    }
+    fclose(fp);
+    delete[] line;
+
+    edge_t nnz_actual = num;
+    *nnz_out = nnz_actual;
+    *nnz_in  = nnz_actual;
+
+    // ---- build out-CSR (row_coo → col_coo) ----
+    vertex_t *out_offset = new vertex_t[nrow + 1]();
+    for (edge_t e = 0; e < nnz_actual; e++) out_offset[row_coo[e] + 1]++;
+    for (vertex_t v = 0; v < nrow; v++) out_offset[v + 1] += out_offset[v];
+
+    edge_t   *out_edge   = new edge_t  [nnz_actual];
+    weight_t *out_weight = new weight_t[nnz_actual];
+    {
+        vertex_t *cnt = new vertex_t[nrow]();
+        for (edge_t e = 0; e < nnz_actual; e++) {
+            vertex_t r = row_coo[e];
+            edge_t idx = out_offset[r] + cnt[r]++;
+            out_edge  [idx] = col_coo[e];
+            out_weight[idx] = val_coo[e];
+        }
+        delete[] cnt;
+    }
+
+    // ---- build in-CSR (col_coo → row_coo, i.e. transpose) ----
+    vertex_t *in_offset = new vertex_t[nrow + 1]();
+    for (edge_t e = 0; e < nnz_actual; e++) in_offset[col_coo[e] + 1]++;
+    for (vertex_t v = 0; v < nrow; v++) in_offset[v + 1] += in_offset[v];
+
+    edge_t   *in_edge   = new edge_t  [nnz_actual];
+    weight_t *in_weight = new weight_t[nnz_actual];
+    {
+        vertex_t *cnt = new vertex_t[nrow]();
+        for (edge_t e = 0; e < nnz_actual; e++) {
+            vertex_t c = col_coo[e];
+            edge_t idx = in_offset[c] + cnt[c]++;
+            in_edge  [idx] = row_coo[e];
+            in_weight[idx] = val_coo[e];
+        }
+        delete[] cnt;
+    }
+
+    // ---- compute s_out[v] = sum of outgoing weights ----
+    weight_t *s_out = new weight_t[nrow]();
+    for (edge_t e = 0; e < nnz_actual; e++) s_out[row_coo[e]] += val_coo[e];
+
+    delete[] row_coo; delete[] col_coo; delete[] val_coo;
+
+    *out_offset_p = out_offset;  *out_edge_p = out_edge;  *out_weight_p = out_weight;
+    *in_offset_p  = in_offset;   *in_edge_p  = in_edge;   *in_weight_p  = in_weight;
+    *s_out_p      = s_out;
     return 0;
 }

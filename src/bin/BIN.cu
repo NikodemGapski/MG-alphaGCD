@@ -14,10 +14,14 @@ BIN::BIN(int bin_num, vertex_t vertex_num)
     bin_offset = new vertex_t [bin_num];
     CUDA_RT_CALL(cudaMalloc((void **) &device_bin_size, sizeof(vertex_t) * bin_num));
     CUDA_RT_CALL(cudaMalloc((void **) &device_bin_offset, sizeof(vertex_t) * bin_num));
-    CUDA_RT_CALL(cudaMalloc((void **) &device_bin_permutation, sizeof(vertex_t) * vertex_num));
-    vertex_t* bin_permutation = new vertex_t [vertex_num];
-    for(vertex_t i = 0; i < vertex_num; i++) bin_permutation[i] = 0;
-    CUDA_RT_CALL(cudaMemcpy(device_bin_permutation, bin_permutation, sizeof(vertex_t) * vertex_num, cudaMemcpyHostToDevice));
+    // Clamp to 1 so cudaMalloc never receives size 0, which may return nullptr
+    // on some CUDA runtimes and cause crashes when the pointer is later freed.
+    vertex_t alloc_num = vertex_num > 0 ? vertex_num : 1;
+    CUDA_RT_CALL(cudaMalloc((void **) &device_bin_permutation, sizeof(vertex_t) * alloc_num));
+    vertex_t* bin_permutation = new vertex_t [alloc_num];
+    for(vertex_t i = 0; i < alloc_num; i++) bin_permutation[i] = 0;
+    CUDA_RT_CALL(cudaMemcpy(device_bin_permutation, bin_permutation, sizeof(vertex_t) * alloc_num, cudaMemcpyHostToDevice));
+    delete[] bin_permutation;
     CUDA_RT_CALL(cudaMalloc((void **) &device_max_degree, sizeof(vertex_t)));
 }
 

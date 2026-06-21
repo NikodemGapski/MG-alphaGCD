@@ -180,6 +180,55 @@ __device__ __forceinline__ weight_t move_gain<Objective::MapEquation>(
     return -dL;  // maximise the codelength decrease
 }
 
+// Directed map equation move gain (teleportation + flow, p_from_in approximated as 0).
+// e_to_m_norm = Σ_{v→w: w∈m} w(v,w)/s_out[v]  (transition probability into own module)
+// e_to_n_norm = Σ_{v→w: w∈n} w(v,w)/s_out[v]  (transition probability into candidate)
+// q_vis_{m,n} are passed as aci+ki and acj (already in probability units from PageRank).
+// qout_{m,n} and q_total are already in probability units (mass=1 in directed mode).
+__device__ __forceinline__ weight_t move_gain_directed_approx(
+    weight_t p_vis_v,     // = ki
+    weight_t q_vis_m,     // = aci + ki
+    weight_t q_vis_n,     // = acj
+    weight_t qout_m,
+    weight_t qout_n,
+    weight_t q_total,
+    weight_t e_to_m_norm, // normalized transition prob from v to m
+    weight_t e_to_n_norm, // normalized transition prob from v to n
+    double tau
+) {
+    const double tv  = tau;
+    const double p   = (double)p_vis_v;
+    const double qm  = (double)q_vis_m;  // q_vis[m], includes v
+    const double qn  = (double)q_vis_n;
+    const double qom = (double)qout_m;
+    const double qon = (double)qout_n;
+    const double Qt  = (double)q_total;
+
+    // q_tau[i] = tau * q_vis[i] (uniform teleportation weights)
+    const double qt_m = tau * qm;
+    const double qt_n = tau * qn;
+
+    // p_to_out[v,m] = p_vis[v] * (1 - e_to_m_norm)
+    const double pto_m = p * (1.0 - (double)e_to_m_norm);
+    const double pto_n = p * (1.0 - (double)e_to_n_norm);
+
+    const double dqm =  tv*(qm*tv - p*(1.0 - qt_m + tv)) + (1.0-tv)*(0.0 - pto_m);
+    const double dqn = -tv*(qn*tv - p*(1.0 - qt_n - tv)) - (1.0-tv)*(0.0 - pto_n);
+
+    // q_vis after the move: m loses v, n gains v
+    const double qvis_m_new = qm - p;
+    const double qvis_n_new = qn + p;
+
+    const auto F = [](double x) -> double { return x > 0. ? x * log2(x) : 0.; };
+    const double dL =
+          (F(Qt + dqm + dqn) - F(Qt))
+        - 2.0 * ((F(qom + dqm) - F(qom)) + (F(qon + dqn) - F(qon)))
+        + (F((qom + dqm) + qvis_m_new) - F(qom + qm))
+        + (F((qon + dqn) + qvis_n_new) - F(qon + qn));
+
+    return (weight_t)(-dL);
+}
+
 // Map equation: fill `shared_device_community_q_out_delta` (indexed by *global*
 // module id) with this PE's partial exit weight, i.e. for every local vertex the
 // sum of its edge weights that cross into a different module. Mirrors the
@@ -238,6 +287,88 @@ compute_community_q_out_local_atomic(
         if (tile32.thread_rank() == 0 && w_ext != 0.) {
             atomicAdd(shared_device_community_q_out_delta + src_community_id, w_ext);
         }
+    }
+}
+
+// Directed map equation: compute per-module exit WALK probability q_walk_out[i]
+// = Σ_{v∈i} p_vis[v] * Σ_{v→w, w∉i} (w(v,w) / s_out[v]).
+// Result is accumulated into q_out_delta (global module index).
+// p_vis = private_device_vertex_weight (local, probability units).
+// s_out = private_device_s_out (NVSHMEM, local index).
+__global__ void __launch_bounds__(1024, 1)
+compute_community_q_walk_out_local_atomic(
+    vertex_t local_vertices,
+    vertex_t total_vertices,
+    vertex_t* private_device_offset,
+    edge_t*   private_device_edge,
+    weight_t* private_device_edge_weight,
+    weight_t* p_vis,
+    weight_t* s_out,
+    vertex_t* private_device_part_vertex_offset,
+    vertex_t* shared_device_community_ids,
+    weight_t* shared_device_community_q_out_delta,
+    int my_pe,
+    int n_pes
+)
+{
+    cg::grid_group grid = cg::this_grid();
+    cg::thread_block block = cg::this_thread_block();
+    auto tile32 = cg::tiled_partition<32>(block);
+    int tile32_num_grid = grid.num_threads() / 32;
+    int tile32_id_grid = (block.num_threads() * block.group_index().x + block.thread_index().x) / 32;
+
+    for (vertex_t i = grid.thread_rank(); i < total_vertices; i += grid.num_threads())
+        shared_device_community_q_out_delta[i] = 0.;
+    grid.sync();
+
+    vertex_t vertex_id;
+    edge_t e;
+    vertex_t src_community_id;
+    vertex_t dst_community_id;
+    vertex_t neighbor_id;
+    int pe_dst;
+
+    for (vertex_id = tile32_id_grid; vertex_id < local_vertices; vertex_id += tile32_num_grid) {
+        src_community_id = shared_device_community_ids[vertex_id];
+        weight_t pv = p_vis[vertex_id];
+        weight_t sv = s_out[vertex_id];
+        weight_t walk_ext = 0.;
+
+        if (sv > 0.) {
+            for (e = private_device_offset[vertex_id] + tile32.thread_rank();
+                 e < private_device_offset[vertex_id + 1]; e += 32) {
+                neighbor_id = private_device_edge[e];
+                locating_vertex(pe_dst, neighbor_id, private_device_part_vertex_offset, n_pes);
+                dst_community_id = (pe_dst == my_pe)
+                    ? shared_device_community_ids[neighbor_id]
+                    : nvshmem_uint32_g(shared_device_community_ids + neighbor_id, pe_dst);
+                if (src_community_id != dst_community_id) {
+                    walk_ext += (weight_t)((double)private_device_edge_weight[e] / (double)sv * (double)pv);
+                }
+            }
+        }
+        walk_ext = cg::reduce(tile32, walk_ext, cg::plus<weight_t>());
+        if (tile32.thread_rank() == 0 && walk_ext != 0.)
+            atomicAdd(shared_device_community_q_out_delta + src_community_id, walk_ext);
+    }
+}
+
+// Directed map equation: apply teleportation correction to convert q_walk_out → q_out.
+// q_out[i] = (1-tau) * (tau*q_vis[i] + q_walk_out[i])
+// where q_vis[i] = shared_device_community_weight[i] (Σ p_vis in module i).
+// Writes directly into shared_device_community_q_out.
+__global__ void __launch_bounds__(1024, 1)
+apply_teleportation_q_out(
+    vertex_t local_vertices,
+    weight_t tau,
+    weight_t* shared_device_community_weight,   // q_vis[i]
+    weight_t* shared_device_community_q_out      // in: q_walk_out[i], out: q_out[i]
+)
+{
+    for (vertex_t i = (blockIdx.x * blockDim.x) + threadIdx.x; i < local_vertices; i += blockDim.x * gridDim.x) {
+        weight_t q_vis  = shared_device_community_weight[i];
+        weight_t q_walk = shared_device_community_q_out[i];
+        shared_device_community_q_out[i] = (weight_t)((1.0 - tau) * (tau * (double)q_vis + (double)q_walk));
     }
 }
 
@@ -700,7 +831,9 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
     bool up_down,
     vertex_t bin_size,
     vertex_t bin_offset,
-    vertex_t* bin_permutation
+    vertex_t* bin_permutation,
+    weight_t* s_out_local,   // nullptr = undirected; local-index s_out array (NVSHMEM)
+    double tau               // teleportation probability (ignored when s_out_local==nullptr)
 )
 {
     int hash_len_tile = TILE_THREADS;   // the size of hash table that each tile has
@@ -735,7 +868,8 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
     vertex_t edge_rb;
     long long unsigned int tmp;
 
-    mass = mass / 2.0;
+    bool directed = (s_out_local != nullptr);
+    if (!directed) mass = mass / 2.0;  // undirected uses halved mass; directed has mass=1
     weight_t q_total = Q_sum[0];
 
     // dynamic shared memory, |hash| = (512 / TILE_THREADS) * hash_len_tile = 512
@@ -753,6 +887,7 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
         src_community_id = shared_device_community_ids[vertex_id];
         src_community_id_copy = src_community_id;
         weight_t ki =  private_device_vertex_weight[vertex_id];
+        weight_t sv = directed ? s_out_local[vertex_id] : (weight_t)1.0;
         edge_lb = private_device_offset[vertex_id];
         edge_rb = private_device_offset[vertex_id + 1];
 
@@ -791,18 +926,19 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
             tmp = dst_community_id * 107;
             hash = tmp % (hash_table_rb - hash_table_lb);
 
+            weight_t wij_norm = (directed && sv > 0.) ? wij / sv : wij;
             if (src_community_id != dst_community_id) {
                 // hash table insert
                 while (true) {
                     old_tmp = atomicCAS(hash_table_key + hash_table_lb + hash, UINT32_MAX, dst_community_id);
                     if (old_tmp == UINT32_MAX || old_tmp == dst_community_id) {
-                        atomicAdd(hash_table_value + hash_table_lb + hash, wij);
+                        atomicAdd(hash_table_value + hash_table_lb + hash, wij_norm);
                         break;
                     }
                     hash = (hash + 1) % (hash_table_rb - hash_table_lb);
                 }
             } else if (src_community_id == dst_community_id && private_device_edge[e] != (vertex_id + begin_vertex_id)) {
-                eici += wij;
+                eici += wij_norm;
             }
         }
 
@@ -828,7 +964,12 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
                     qout_n = nvshmem_double_g(shared_device_community_q_out + old_tmp, pe_dst);
                 }
 
-                wij = move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
+                if (directed) {
+                    wij = move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total,
+                                                    eici, hash_table_value[e], tau);
+                } else {
+                    wij = move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
+                }
                 if (up_down) {
                     if ( (wij > best_modularity) || (wij == best_modularity && src_community_id < dst_community_id) ) {
                         dst_community_id = src_community_id;
@@ -896,7 +1037,9 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
     vertex_t bin_size,
     vertex_t bin_offset,
     vertex_t* bin_permutation,
-    vertex_t total_vertices
+    vertex_t total_vertices,
+    weight_t* s_out_local,
+    double tau
     )
 {
     cg::grid_group grid = cg::this_grid();
@@ -922,7 +1065,8 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
     weight_t qout_n;
     int pe_dst;
     long long unsigned int tmp;
-    mass = mass / 2.0;
+    bool directed = (s_out_local != nullptr);
+    if (!directed) mass = mass / 2.0;
     weight_t q_total = Q_sum[0];
 
     __shared__ vertex_t hash_table_key[HASH_LEN];
@@ -965,12 +1109,14 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
     qout_m = reduce_buffer[2];
     block.sync();
 
+    weight_t sv_bk = directed ? s_out_local[vertex_id] : (weight_t)1.0;
     for (e = private_device_offset[vertex_id] + block.thread_rank(); e < private_device_offset[vertex_id + 1]; e += block.num_threads()) {
         neighbor_id = private_device_edge[e];
         locating_vertex(pe_dst, neighbor_id, private_device_part_vertex_offset, n_pes);
         dst_community_id = nvshmem_uint32_g(shared_device_community_ids + neighbor_id, pe_dst);
 
         wij = private_device_edge_weight[e];
+        weight_t wij_norm = (directed && sv_bk > 0.) ? wij / sv_bk : wij;
         tmp = dst_community_id * 107;
         hash = tmp % HASH_LEN;
 
@@ -979,13 +1125,13 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
             while (true) {
                 old_tmp = atomicCAS(hash_table_key + hash, UINT32_MAX, dst_community_id);
                 if (old_tmp == UINT32_MAX || old_tmp == dst_community_id) {
-                    atomicAdd(hash_table_value + hash, wij);
+                    atomicAdd(hash_table_value + hash, wij_norm);
                     break;
                 }
                 hash = (hash + 1) % HASH_LEN;
             }
         } else if (src_community_id == dst_community_id && private_device_edge[e] != (vertex_id + begin_vertex_id)) {
-            eici += wij;
+            eici += wij_norm;
         }
     }
 
@@ -1017,7 +1163,9 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
                 qout_n = nvshmem_double_g(shared_device_community_q_out + old_tmp, pe_dst);
             }
 
-            wij = move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
+            wij = directed
+                ? move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total, eici, hash_table_value[e], tau)
+                : move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
             // Add a constraint: when the best score is the same, choose the one with the smallest ID.
             if (up_down) {
                 if ( (wij > best_modularity) || (wij == best_modularity && src_community_id < dst_community_id) ) {
@@ -1126,7 +1274,9 @@ calculate_eicj_and_move_vertex_gl_bk(
     vertex_t bin_size,
     vertex_t bin_offset,
     vertex_t* bin_permutation,
-    edge_t HASH_LEN
+    edge_t HASH_LEN,
+    weight_t* s_out_local,
+    double tau
 )
 {
     cg::grid_group grid = cg::this_grid();
@@ -1153,7 +1303,8 @@ calculate_eicj_and_move_vertex_gl_bk(
     weight_t qout_n;
     int pe_dst;
     long long unsigned int tmp;
-    mass = mass / 2.0;
+    bool directed = (s_out_local != nullptr);
+    if (!directed) mass = mass / 2.0;
     weight_t q_total = Q_sum[0];
 
     __shared__ vertex_t buffer_int[1024/32];
@@ -1205,6 +1356,8 @@ calculate_eicj_and_move_vertex_gl_bk(
             dst_community_id = nvshmem_uint32_g(shared_device_community_ids + neighbor_id, pe_dst);
 
             wij = private_device_edge_weight[e];
+            weight_t sv_gl = directed ? s_out_local[vertex_id] : (weight_t)1.0;
+            weight_t wij_norm = (directed && sv_gl > 0.) ? wij / sv_gl : wij;
             tmp = dst_community_id * 107;
             hash = tmp % HASH_LEN;
 
@@ -1213,13 +1366,13 @@ calculate_eicj_and_move_vertex_gl_bk(
                 while (true) {
                     old_tmp = atomicCAS(hash_table_key + hash_table_lb + hash, UINT32_MAX, dst_community_id);
                     if (old_tmp == UINT32_MAX || old_tmp == dst_community_id) {
-                        atomicAdd(hash_table_value + hash_table_lb + hash, wij);
+                        atomicAdd(hash_table_value + hash_table_lb + hash, wij_norm);
                         break;
                     }
                     hash = (hash + 1) % HASH_LEN;
                 }
             } else if (src_community_id == dst_community_id && private_device_edge[e] != (vertex_id + begin_vertex_id)) {
-                eici += wij;
+                eici += wij_norm;
             }
         }
 
@@ -1251,7 +1404,9 @@ calculate_eicj_and_move_vertex_gl_bk(
                     qout_n = nvshmem_double_g(shared_device_community_q_out + old_tmp, pe_dst);
                 }
 
-                wij = move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
+                wij = directed
+                    ? move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total, eici, hash_table_value[e], tau)
+                    : move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
                 // Add a constraint: when the best score is the same, choose the one with the smallest ID.
                 if (up_down) {
                     if ( (wij > best_modularity) || (wij == best_modularity && src_community_id < dst_community_id) ) {
@@ -1355,7 +1510,9 @@ void calculate_eicj_and_move_vertex_bin(
     BIN *bins,
     cudaStream_t *streams,
     vertex_t total_vertices,
-    cudaStream_t default_stream
+    cudaStream_t default_stream,
+    weight_t* s_out_local,   // nullptr = undirected
+    double tau               // ignored when s_out_local == nullptr
 ){
     int grid_num;
     int block_num;
@@ -1379,7 +1536,8 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_ids_new, shared_device_community_ids,
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
-                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            s_out_local, tau);
                     break;
                 case 1:
                     // tile4 for a vertex whose #edges is less than 4
@@ -1393,7 +1551,8 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_ids_new, shared_device_community_ids,
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
-                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            s_out_local, tau);
                     break;
                 case 2:
                     // tile8 for a vertex whose #edges is less than 8
@@ -1407,7 +1566,8 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_ids_new, shared_device_community_ids,
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
-                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            s_out_local, tau);
                     break;
                 case 3:
                     // tile16 for a vertex whose #edges is less than 16
@@ -1421,7 +1581,8 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_ids_new, shared_device_community_ids,
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
-                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            s_out_local, tau);
                     break;
 
                 case 4:
@@ -1436,7 +1597,8 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_ids_new, shared_device_community_ids,
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
-                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation);
+                            bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
+                            s_out_local, tau);
                     break;
                 case 5:
                     block_num = 128;
@@ -1449,7 +1611,7 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            total_vertices);
+                            total_vertices, s_out_local, tau);
                     break;
                 case 6:
                     block_num = 512;
@@ -1462,7 +1624,7 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            total_vertices);
+                            total_vertices, s_out_local, tau);
                     break;
                 case 7:
                     block_num = 1024;
@@ -1475,7 +1637,7 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            total_vertices);
+                            total_vertices, s_out_local, tau);
                     break;
                 case 8:
                     block_num = 1024;
@@ -1488,7 +1650,7 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            total_vertices);
+                            total_vertices, s_out_local, tau);
                     break;
                 case 9:
                     int SMs = 80;
@@ -1508,7 +1670,7 @@ void calculate_eicj_and_move_vertex_bin(
                             hash_table_key, hash_table_value,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            max_degree);
+                            max_degree, s_out_local, tau);
                     break;
             }
         }
@@ -1622,10 +1784,166 @@ compute_community_weight(
     }
 }
 
+} // namespace louvain
+
+// File-scope device helper: determine which PE owns global vertex vid and
+// convert vid to a local index.  Mirrors louvain::locating_vertex exactly.
+__device__ __inline__ void locate_vertex_pe(
+    int &pe, vertex_t &vid, vertex_t* part_vertex_offset, int n_pes)
+{
+    for (int i = 0; i < n_pes; i++) {
+        if (vid < part_vertex_offset[i + 1]) {
+            pe  = i;
+            vid = vid - part_vertex_offset[i];
+            break;
+        }
+    }
 }
 
+// One iteration of the distributed PageRank power iteration.
+// p_cur[lv]  = current p_vis for local vertex lv (local index, indexed 0..local_vertices-1)
+// p_new[lv]  = output p_vis after this step
+// in_offset[lv], in_edge[e], in_edge_weight[e] = in-CSR for local vertices
+//   (in_edge[e] is a GLOBAL source vertex id)
+// s_out[lu]  = out-strength of local vertex lu on THIS PE (NVSHMEM symmetric)
+// pr_reduce  = 2 doubles of NVSHMEM symmetric scratch: [dangling_mass, l1_norm]
+// N          = total_vertices (normalizer for uniform teleportation)
+__global__ void __launch_bounds__(1024, 1)
+pagerank_step(
+    vertex_t local_vertices,
+    double   tau,
+    double   inv_N,              // 1.0 / total_vertices
+    weight_t *p_cur,             // NVSHMEM: remote PEs read p_cur[local_idx] from us
+    weight_t *p_new,             // plain cudaMalloc: local output
+    vertex_t *in_offset,
+    edge_t   *in_edge,
+    weight_t *in_edge_weight,
+    weight_t *s_out,             // NVSHMEM: remote PEs read s_out[local_idx] from us
+    vertex_t *part_vertex_offset,
+    int       my_pe,
+    int       n_pes,
+    weight_t *pr_reduce          // NVSHMEM: [0]=dangling_mass, [1]=l1_norm
+) {
+    cg::grid_group grid = cg::this_grid();
+    cg::thread_block block = cg::this_thread_block();
+    auto tile32 = cg::tiled_partition<32>(block);
+
+    if (grid.thread_rank() == 0) {
+        pr_reduce[0] = 0.;  // dangling mass accumulator
+        pr_reduce[1] = 0.;  // l1 norm accumulator
+    }
+    grid.sync();
+
+    // Phase 1: compute local dangling mass (vertices with s_out == 0)
+    weight_t local_dangling = 0.;
+    for (vertex_t lv = grid.thread_rank(); lv < local_vertices; lv += grid.num_threads()) {
+        if (s_out[lv] == 0.) local_dangling += p_cur[lv];
+    }
+    local_dangling = cg::reduce(tile32, local_dangling, cg::plus<weight_t>());
+    if (tile32.thread_rank() == 0) atomicAdd(pr_reduce + 0, local_dangling);
+    grid.sync();
+
+    if (block.group_index().x == 0 && tile32.meta_group_rank() == 0) {
+        nvshmemx_double_sum_reduce_warp(NVSHMEM_TEAM_WORLD, pr_reduce, pr_reduce, 1);
+    }
+    grid.sync();
+
+    double dangling_mass = pr_reduce[0];
+
+    // Phase 2: compute new p_vis for each local vertex via in-CSR
+    weight_t local_l1 = 0.;
+    int tile32_num_grid = grid.num_threads() / 32;
+    int tile32_id_grid  = (block.num_threads() * block.group_index().x + block.thread_index().x) / 32;
+
+    for (vertex_t lv = tile32_id_grid; lv < local_vertices; lv += tile32_num_grid) {
+        weight_t acc = 0.;
+        edge_t e_start = in_offset[lv];
+        edge_t e_end   = in_offset[lv + 1];
+        for (edge_t e = e_start + tile32.thread_rank(); e < e_end; e += 32) {
+            vertex_t u_id = in_edge[e];   // global source vertex (modified to local by locate_vertex_pe)
+            int u_pe;
+            locate_vertex_pe(u_pe, u_id, part_vertex_offset, n_pes);
+            // After locate_vertex_pe, u_id is the LOCAL index on u_pe
+
+            weight_t pu = (u_pe == my_pe) ? p_cur[u_id] : nvshmem_double_g(p_cur + u_id, u_pe);
+            weight_t su = (u_pe == my_pe) ? s_out[u_id] : nvshmem_double_g(s_out + u_id, u_pe);
+            if (su > 0.) acc += (weight_t)((double)in_edge_weight[e] / (double)su * (double)pu);
+        }
+        acc = cg::reduce(tile32, acc, cg::plus<weight_t>());
+        if (tile32.thread_rank() == 0) {
+            weight_t new_p = (weight_t)(tau * inv_N + (1.0 - tau) * ((double)acc + dangling_mass * inv_N));
+            local_l1 += (new_p > p_cur[lv] ? new_p - p_cur[lv] : p_cur[lv] - new_p);
+            p_new[lv] = new_p;
+        }
+    }
+
+    local_l1 = cg::reduce(tile32, local_l1, cg::plus<weight_t>());
+    if (tile32.thread_rank() == 0) atomicAdd(pr_reduce + 1, local_l1);
+    grid.sync();
+
+    if (block.group_index().x == 0 && tile32.meta_group_rank() == 0) {
+        nvshmemx_double_sum_reduce_warp(NVSHMEM_TEAM_WORLD, pr_reduce + 1, pr_reduce + 1, 1);
+    }
+    grid.sync();
+}
 
 namespace louvain {
+
+// Run PageRank power iteration until convergence or max_iter, replacing
+// p_cur (== private_device_vertex_weight) with the ergodic visit distribution.
+// Only executed in directed mode (tau > 0 && gpuGraph->is_directed_()).
+static void launch_pagerank(
+    vertex_t local_vertices,
+    vertex_t total_vertices,
+    double tau,
+    weight_t *p_cur,               // NVSHMEM: private_device_vertex_weight
+    weight_t *p_new,               // plain cudaMalloc scratch (local only)
+    vertex_t *in_offset,
+    edge_t   *in_edge,
+    weight_t *in_edge_weight,
+    weight_t *s_out,               // NVSHMEM: private_device_s_out
+    vertex_t *part_vertex_offset,
+    weight_t *pr_reduce,           // NVSHMEM: 2-element scratch
+    int my_pe,
+    int n_pes,
+    int block_dims,
+    size_t d_shared_mem,
+    cudaStream_t stream,
+    int max_pr_iter = 100,
+    double pr_eps   = 1e-6
+) {
+    int grid_size = 0;
+    double inv_N = 1.0 / (double)total_vertices;
+
+    void *args[] = {
+        (void *) &local_vertices, (void *) &tau, (void *) &inv_N,
+        (void *) &p_cur, (void *) &p_new,
+        (void *) &in_offset, (void *) &in_edge, (void *) &in_edge_weight,
+        (void *) &s_out, (void *) &part_vertex_offset,
+        (void *) &my_pe, (void *) &n_pes, (void *) &pr_reduce
+    };
+
+    for (int iter = 0; iter < max_pr_iter; iter++) {
+        NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)pagerank_step, block_dims, args, d_shared_mem, &grid_size));
+        nvshmem_barrier_all();
+        NVSHMEM_CHECK(nvshmemx_collective_launch((void *)pagerank_step, grid_size, block_dims, args, d_shared_mem, stream));
+        nvshmemx_barrier_all_on_stream(stream);
+        CUDA_RT_CALL(cudaStreamSynchronize(stream));
+
+        // read L1 convergence norm from pr_reduce[1]
+        weight_t l1;
+        CUDA_RT_CALL(cudaMemcpy(&l1, pr_reduce + 1, sizeof(weight_t), cudaMemcpyDeviceToHost));
+
+        // swap p_new → p_cur for all local vertices
+        // (reuse a simple copy kernel; copy from p_new → p_cur)
+        copy<weight_t><<<80, 1024, 0, stream>>>(p_new, p_cur, local_vertices);
+        CUDA_RT_CALL(cudaStreamSynchronize(stream));
+        // update the args pointer for p_cur (no-op: same pointer, contents updated in-place)
+
+        if (l1 < (weight_t)pr_eps) break;
+    }
+}
+
 // Launch the three map-equation kernels that score a partition: compute the
 // per-module exit weights (q_out) for `community_ids`, then assemble the
 // codelength, writing score = -L into Q and the raw exit sum into Q_sum.
@@ -1651,21 +1969,40 @@ static void launch_compute_codelength(
     int n_pes,
     int block_dims,
     size_t d_shared_mem,
-    cudaStream_t default_stream)
+    cudaStream_t default_stream,
+    // directed-mode extras (nullptr = undirected)
+    weight_t* s_out = nullptr,
+    double tau = 0.0)
 {
     int grid_size = 0;
 
     // 1) per-PE partial exit weights into q_out_delta (indexed by global module)
-    void *a1[] = {
+    if (s_out != nullptr) {
+        // directed: compute q_walk_out using p_vis-weighted out-CSR
+        void *a1d[] = {
+            (void *) &local_vertices, (void *) &total_vertices,
+            (void *) &private_device_offset, (void *) &private_device_edge,
+            (void *) &private_device_edge_weight,
+            (void *) &private_device_vertex_weight, (void *) &s_out,
+            (void *) &private_device_part_vertex_offset,
+            (void *) &community_ids, (void *) &q_out_delta,
+            (void *) &my_pe, (void *) &n_pes
+        };
+        NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_community_q_walk_out_local_atomic, block_dims, a1d, d_shared_mem, &grid_size));
+        nvshmem_barrier_all();
+        NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_q_walk_out_local_atomic, grid_size, block_dims, a1d, d_shared_mem, default_stream));
+    } else {
+        void *a1[] = {
             (void *) &local_vertices, (void *) &total_vertices,
             (void *) &private_device_offset, (void *) &private_device_edge,
             (void *) &private_device_edge_weight, (void *) &private_device_part_vertex_offset,
             (void *) &community_ids, (void *) &q_out_delta,
             (void *) &my_pe, (void *) &n_pes
-    };
-    NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_community_q_out_local_atomic, block_dims, a1, d_shared_mem, &grid_size));
-    nvshmem_barrier_all();
-    NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_q_out_local_atomic, grid_size, block_dims, a1, d_shared_mem, default_stream));
+        };
+        NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_community_q_out_local_atomic, block_dims, a1, d_shared_mem, &grid_size));
+        nvshmem_barrier_all();
+        NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_q_out_local_atomic, grid_size, block_dims, a1, d_shared_mem, default_stream));
+    }
     nvshmemx_barrier_all_on_stream(default_stream);
     CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
@@ -1680,6 +2017,14 @@ static void launch_compute_codelength(
     NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_q_out, grid_size, block_dims, a2, d_shared_mem, default_stream));
     nvshmemx_barrier_all_on_stream(default_stream);
     CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
+    // 2b) directed: apply teleportation correction q_walk_out → q_out
+    if (s_out != nullptr) {
+        weight_t tau_f = (weight_t)tau;
+        apply_teleportation_q_out<<<80, 1024, 0, default_stream>>>(
+            local_vertices, tau_f, shared_device_community_weight, shared_device_community_q_out);
+        CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+    }
 
     // 3) assemble codelength -> Q (= -L), Q_sum (= raw Sum_i cut_i)
     void *a3[] = {
@@ -1697,7 +2042,7 @@ static void launch_compute_codelength(
 }  // namespace louvain
 
 void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double threshold, const int max_iter,
-                           const int max_phases) {
+                           const int max_phases, const double tau) {
     int n_pes = nvshmem_n_pes();
     int my_pe = nvshmem_my_pe();
 
@@ -1729,6 +2074,29 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 
     // init bins
     BIN* bins = new BIN(BIN_NUM, local_vertices);
+
+    // directed-mode PageRank scratch
+    const bool directed = gpuGraph->is_directed_();
+    weight_t *pr_p_cur   = nullptr;  // NVSHMEM: symmetric current p (remote PEs read it)
+    weight_t *pr_p_new   = nullptr;  // local-only scratch for PageRank new p
+    weight_t *pr_reduce  = nullptr;  // NVSHMEM: 2 doubles [dangling_mass, l1_norm]
+    vertex_t *pr_in_offset = nullptr;
+    edge_t   *pr_in_edge   = nullptr;
+    weight_t *pr_in_edge_weight = nullptr;
+    weight_t *pr_s_out   = nullptr;
+    if (directed) {
+        // pr_p_cur MUST be symmetric: pagerank_step fetches it from remote PEs via
+        // nvshmem_double_g. private_device_vertex_weight is a plain cudaMalloc and
+        // cannot be used as the symmetric source (illegal access at -np >= 2).
+        pr_p_cur      = (weight_t *) nvshmem_malloc(total_vertices * sizeof(weight_t));
+        CUDA_RT_CALL(cudaMemset(pr_p_cur, 0, total_vertices * sizeof(weight_t)));
+        CUDA_RT_CALL(cudaMalloc((void **) &pr_p_new, sizeof(weight_t) * local_vertices));
+        pr_reduce     = (weight_t *) nvshmem_malloc(2 * sizeof(weight_t));
+        pr_in_offset  = gpuGraph->get_private_device_in_offset_();
+        pr_in_edge    = gpuGraph->get_private_device_in_edge_();
+        pr_in_edge_weight = gpuGraph->get_private_device_in_edge_weight_();
+        pr_s_out      = gpuGraph->get_private_device_s_out_();
+    }
 
     // nvshmem shared memory
     auto *shared_device_community_weight = gpuGraph->get_shared_device_community_weight_();
@@ -1769,8 +2137,16 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 
     int phase_num = 0;
     int loop_total = 0;
+    // Track the original mass for restoring after directed Phase 0.
+    weight_t original_mass = mass;
     start_total = MPI_Wtime();
     while (phase_num < max_phases && (Q_host - Q_old_host) > threshold) {
+
+        // Directed mode is only fully supported in Phase 0 (before coarsening).
+        // Phase 1+ uses the coarsened out-CSR (undirected symmetrized), so the in-CSR
+        // would be stale. Fall back to undirected coarsening path for Phase 1+.
+        // B6 (full directed coarsening) is future work.
+        bool phase_directed = directed && (phase_num == 0);
 
         weight_t new_Q;
         weight_t cur_Q;
@@ -1800,9 +2176,57 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                                  private_device_vertex_weight);
         CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
+        // 2b. Directed mode: replace k_v with PageRank ergodic visit probability p_vis[v].
+        //     Normalize k_v to probability units first (uniform init), then iterate.
+        if (phase_directed) {
+            // Initialize p_vis = k_v / Σk_v  (out-strength as initial distribution)
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+            weight_t local_sum = thrust::reduce(
+                thrust::device_pointer_cast(private_device_vertex_weight),
+                thrust::device_pointer_cast(private_device_vertex_weight) + local_vertices,
+                (weight_t)0.0, thrust::plus<weight_t>());
+            // Global sum via MPI (avoids NVSHMEM host-side reduce which may not be available)
+            weight_t global_sum = 0.0;
+            MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            if (global_sum > 0.) {
+                weight_t inv_sum = (weight_t)(1.0 / (double)global_sum);
+                // Scale private_device_vertex_weight by inv_sum in-place (no __device__ lambda)
+                thrust::transform(
+                    thrust::device_pointer_cast(private_device_vertex_weight),
+                    thrust::device_pointer_cast(private_device_vertex_weight) + local_vertices,
+                    thrust::make_constant_iterator(inv_sum),
+                    thrust::device_pointer_cast(private_device_vertex_weight),
+                    thrust::multiplies<weight_t>());
+            }
+            // Stage the normalized init into the symmetric buffer pr_p_cur, run
+            // PageRank there (so remote PEs can read each other's p via NVSHMEM),
+            // then copy the converged p_vis back into private_device_vertex_weight.
+            // copy(src, dst, len): dst[i] = src[i].
+            copy<weight_t><<<80, 1024, 0, default_stream>>>(private_device_vertex_weight, pr_p_cur, local_vertices);
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+            // Run PageRank power iteration on the symmetric buffer
+            launch_pagerank(local_vertices, total_vertices, tau,
+                            pr_p_cur, pr_p_new,
+                            pr_in_offset, pr_in_edge, pr_in_edge_weight, pr_s_out,
+                            private_device_part_vertex_offset,
+                            pr_reduce, my_pe, n_pes,
+                            block_dims, d_shared_mem, default_stream);
+            copy<weight_t><<<80, 1024, 0, default_stream>>>(pr_p_cur, private_device_vertex_weight, local_vertices);
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+            // After convergence: p_vis is in private_device_vertex_weight (normalized, Σ = 1)
+            // Override mass to 1.0 so codelength uses probability units.
+            mass = 1.0;
+        } else if (phase_num > 0) {
+            // Phase 1+: restore mass from the coarsened graph (out-strength sum, not p_vis units).
+            mass = original_mass;
+        }
+
+        // Seed community weight from vertex weight for the singleton partition
+        // (community[v] = v at the start of each phase, so vol[i] = pvw[i_local]).
+        // The inner move-loop updates this incrementally after each reassignment.
+        // NOTE: copy(src, dst, len) does dst[i] = src[i]; here dst = community_weight.
         copy<weight_t><<<80, 1024, 0, default_stream>>>(private_device_vertex_weight, shared_device_community_weight, local_vertices);
         CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
-
 
         // 3. Compute the initial codelength score (-L) of this phase
         launch_compute_codelength(mass, local_vertices, total_vertices,
@@ -1810,7 +2234,8 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                   private_device_part_vertex_offset, shared_device_community_ids,
                                   shared_device_community_weight, shared_device_community_q_out,
                                   shared_device_community_delta_weight, private_device_vertex_weight,
-                                  cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream);
+                                  cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream,
+                                  phase_directed ? pr_s_out : nullptr, phase_directed ? tau : 0.0);
 
         CUDA_RT_CALL(cudaMemcpy(&new_Q, Q, sizeof(weight_t) , cudaMemcpyDeviceToHost));
 
@@ -1857,7 +2282,9 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                 bins,
                                                 streams,
                                                total_vertices,
-                                               default_stream);
+                                               default_stream,
+                                               phase_directed ? pr_s_out : nullptr,
+                                               phase_directed ? tau : 0.0);
 
 
 
@@ -1905,7 +2332,8 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                       private_device_part_vertex_offset, shared_device_community_ids_new,
                                       shared_device_community_weight, shared_device_community_q_out,
                                       shared_device_community_delta_weight, private_device_vertex_weight,
-                                      cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream);
+                                      cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream,
+                                      phase_directed ? pr_s_out : nullptr, phase_directed ? tau : 0.0);
 
             stop_in_loop = MPI_Wtime();
             compute_modularity_time += (stop_in_loop - start_in_loop);
@@ -1966,6 +2394,14 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         local_vertices = gpuGraph->get_local_vertices_();
         total_vertices = gpuGraph->get_total_vertices_();
 
+        // In directed mode, the in-CSR is NOT rebuilt by coarsen_graph (B6 is not yet implemented).
+        // The directed path is only active for Phase 0; Phase 1+ uses undirected coarsened graph.
+        // Reallocate p_new scratch for the new (smaller) local vertex count.
+        if (directed) {
+            CUDA_RT_CALL(cudaFree(pr_p_new));
+            CUDA_RT_CALL(cudaMalloc((void **) &pr_p_new, sizeof(weight_t) * local_vertices));
+        }
+
         nvshmem_barrier_all();
         CUDA_RT_CALL(cudaDeviceSynchronize());
     }
@@ -1990,5 +2426,10 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     nvshmem_free(Q);
     nvshmem_free(Q_sum);
     nvshmem_free(cl_reduce);
+    if (directed) {
+        CUDA_RT_CALL(cudaFree(pr_p_new));
+        nvshmem_free(pr_reduce);
+        nvshmem_free(pr_p_cur);
+    }
 }
 

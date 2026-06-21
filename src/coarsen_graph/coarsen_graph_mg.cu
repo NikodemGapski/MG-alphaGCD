@@ -1479,7 +1479,8 @@ void cal_exact_degree_of_communities(
     vertex_t *device_fail_count;
     vertex_t *device_fail_permutation;
     CUDA_RT_CALL(cudaMalloc((void **) &device_fail_count, sizeof(vertex_t)));
-    CUDA_RT_CALL(cudaMalloc((void **) &device_fail_permutation, sizeof(vertex_t) * bins->bin_size[10]));
+    // Clamp to 1 to avoid cudaMalloc(0) returning nullptr on some CUDA runtimes.
+    CUDA_RT_CALL(cudaMalloc((void **) &device_fail_permutation, sizeof(vertex_t) * (bins->bin_size[10] > 0 ? bins->bin_size[10] : 1)));
     CUDA_RT_CALL(cudaMemcpy(device_fail_count, &fail_count, sizeof(vertex_t), cudaMemcpyHostToDevice));
 
     for (int i = BIN_NUM_COARSEN_GRAPH - 1; i >= 0; i--) {
@@ -1721,6 +1722,10 @@ void cal_exact_degree_of_communities(
     CUDA_RT_CALL(cudaMemcpy(&fail_count, device_fail_count, sizeof(vertex_t), cudaMemcpyDeviceToHost));
     vertex_t hash_table_len = bins->max_degree * 2;
     hash_table_len = hash_table_len > total_com_num ? total_com_num : hash_table_len;
+    // Clamp to 1: when this PE owns zero communities (max_degree==0 and
+    // total_com_num==0) cudaMalloc(0) can return nullptr; the collective kernel
+    // is still launched and the host must pass a non-null device pointer.
+    if (hash_table_len == 0) hash_table_len = 1;
     vertex_t * hash_table_key = nullptr;
     CUDA_RT_CALL(cudaMalloc((void **) &hash_table_key, sizeof(vertex_t) * hash_table_len));
 
@@ -2177,8 +2182,21 @@ void coarsen_graph_mg::coarsen_graph(HostGraph *hostGraph, GpuGraph *gpuGraph, i
     CUDA_RT_CALL(cudaMemcpy(&new_local_edges, device_offset_tmp + local_com_num, sizeof(vertex_t), cudaMemcpyDeviceToHost));
     gpuGraph->set_local_edges_(new_local_edges);
 
-    CUDA_RT_CALL(cudaMalloc((void **) &device_edges_tmp, sizeof(edge_t) * new_local_edges));
-    CUDA_RT_CALL(cudaMalloc((void **) &device_edges_weight_tmp, sizeof(weight_t) * new_local_edges));
+    // Diagnostic: log per-PE state so any future crash shows up in stdout.
+    // Near convergence one PE may receive zero communities; guard cudaMalloc(0)
+    // which can return nullptr on some CUDA runtimes and cause later crashes.
+    printf("[PE %d] coarsen: global_com=%u  part=[%u,%u)  local_com=%u  new_edges=%u\n",
+           my_pe,
+           (unsigned)part_community_offset[n_pes],
+           (unsigned)part_community_offset[my_pe],
+           (unsigned)part_community_offset[my_pe + 1],
+           (unsigned)local_com_num,
+           (unsigned)new_local_edges);
+
+    // Allocate at least 1 element; cudaMalloc(0) may return nullptr on some
+    // CUDA versions, which would later be dereferenced or rejected by cudaFree.
+    CUDA_RT_CALL(cudaMalloc((void **) &device_edges_tmp, sizeof(edge_t) * (new_local_edges > 0 ? new_local_edges : 1)));
+    CUDA_RT_CALL(cudaMalloc((void **) &device_edges_weight_tmp, sizeof(weight_t) * (new_local_edges > 0 ? new_local_edges : 1)));
 
     stop = MPI_Wtime();
     symbolic_time += (stop - start);

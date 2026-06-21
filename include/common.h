@@ -14,6 +14,10 @@
 #include <nvshmemx.h>
 #include <thrust/host_vector.h>
 #include <thrust/reduce.h>
+#include <thrust/device_ptr.h>
+#include <thrust/transform.h>
+#include <thrust/functional.h>
+#include <thrust/iterator/constant_iterator.h>
 //#include <cub/cub.cuh>
 #include <omp.h>
 #include <mpi.h>

@@ -3,7 +3,10 @@
 GpuGraph::GpuGraph(int n_pes, HostGraph *hostGraph):
 total_vertices_(hostGraph->get_total_vertices_()), total_edges_(hostGraph->get_total_edge_()),
 private_device_edge_(nullptr), private_device_edge_weight_(nullptr),
-mass_(hostGraph->get_mass_())
+mass_(hostGraph->get_mass_()),
+private_device_in_offset_(nullptr), private_device_in_edge_(nullptr),
+private_device_in_edge_weight_(nullptr), private_device_s_out_(nullptr),
+len_in_edges_array_(0), directed_(hostGraph->is_directed_())
 {
     part_vertex_offset_ = new vertex_t[n_pes + 1];
     CUDA_RT_CALL(cudaMalloc((void **) &private_device_part_vertex_offset_, sizeof(vertex_t) * (n_pes + 1)));
@@ -17,6 +20,16 @@ mass_(hostGraph->get_mass_())
     CUDA_RT_CALL(cudaMemset(shared_device_community_weight_, 0., total_vertices_ * sizeof(weight_t)));
     CUDA_RT_CALL(cudaMemset(shared_device_community_delta_weight_, 0., total_vertices_ * sizeof(weight_t)));
     CUDA_RT_CALL(cudaMemset(shared_device_community_q_out_, 0., total_vertices_ * sizeof(weight_t)));
+
+    if (directed_) {
+        // in-CSR offset array: same size as out-CSR offset (indexed by global vertex id)
+        private_device_in_offset_ = (vertex_t *) nvshmem_malloc ((total_vertices_ + 1) * sizeof(vertex_t));
+        // in-edge / in-weight / s_out are allocated by edge_partition::partitioner after
+        // the vertex split is known (same as out-edge/out-weight).
+        // s_out is also NVSHMEM so remote PEs can fetch it during move-gain computation.
+        private_device_s_out_ = (weight_t *) nvshmem_malloc (total_vertices_ * sizeof(weight_t));
+        CUDA_RT_CALL(cudaMemset(private_device_s_out_, 0, total_vertices_ * sizeof(weight_t)));
+    }
 }
 
 vertex_t *GpuGraph::get_private_device_offset_() {
