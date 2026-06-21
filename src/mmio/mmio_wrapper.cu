@@ -95,7 +95,7 @@ void init_data_from_mtx(char *file_path, vertex_t *&offset, edge_t *&colindex, w
         exit(1);
     }
 
-    fgets(line, LINE_LENGTH_MAX, fp);
+    (void)fgets(line, LINE_LENGTH_MAX, fp);
     if (strstr(line, "general")) {
         mm_is_symmetric = false;
     } else if (strstr(line, "symmetric")) {
@@ -103,7 +103,7 @@ void init_data_from_mtx(char *file_path, vertex_t *&offset, edge_t *&colindex, w
     }
 
     do {
-        fgets(line, LINE_LENGTH_MAX, fp);
+        (void)fgets(line, LINE_LENGTH_MAX, fp);
     } while (line[0] == '%');
 
     /* Get size info */
@@ -318,7 +318,7 @@ int loadMMDirectedSparseMatrix(
     if (!fp) { printf("Cannot find file: %s\n", filename); exit(1); }
 
     // read banner
-    fgets(line, LINE_LENGTH_MAX, fp);
+    (void)fgets(line, LINE_LENGTH_MAX, fp);
     // skip comment lines
     while (fgets(line, LINE_LENGTH_MAX, fp) && line[0] == '%') {}
 
