@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 14)
 include_directories(include)
 include_directories(include/mmio)
 
-set(CMAKE_CUDA_ARCHITECTURES "70")
+set(CMAKE_CUDA_ARCHITECTURES "70" CACHE STRING "CUDA architectures")
 find_package(CUDAToolkit ${NVCC_VER_MIN} REQUIRED)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
