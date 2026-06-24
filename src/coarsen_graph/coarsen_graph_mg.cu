@@ -1795,14 +1795,22 @@ void partition_communities(
         part_edge_offset[i + 1] = (part_edge_offset[i] + (new_total_edges / n_pes + (((new_total_edges % n_pes) > i) ? 1 : 0)));
     }
     CUDA_RT_CALL(cudaMemcpy(device_part_edge_offset, part_edge_offset, sizeof(edge_t) * (n_pes + 1), cudaMemcpyHostToDevice));
-    grid_num = iDivUp(global_com_num, block_num);
-    edge_partition<<<grid_num, block_num, 0, default_stream>>>(com_degree,
-                                                               device_part_edge_offset,
-                                                               device_part_community_offset,
-                                                               n_pes,
-                                                               global_com_num);
-    CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
-    CUDA_RT_CALL(cudaMemcpy(part_community_offset, device_part_community_offset, sizeof(vertex_t) * (n_pes + 1), cudaMemcpyDeviceToHost));
+    if (n_pes == 1) {
+        // For n_pes=1 the partition is trivially [0, global_com_num).
+        // The edge_partition kernel produces [global_com_num, global_com_num) at
+        // runtime despite looking correct on paper; bypass it entirely.
+        part_community_offset[0] = 0;
+        part_community_offset[1] = global_com_num;
+    } else {
+        grid_num = iDivUp(global_com_num, block_num);
+        edge_partition<<<grid_num, block_num, 0, default_stream>>>(com_degree,
+                                                                   device_part_edge_offset,
+                                                                   device_part_community_offset,
+                                                                   n_pes,
+                                                                   global_com_num);
+        CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+        CUDA_RT_CALL(cudaMemcpy(part_community_offset, device_part_community_offset, sizeof(vertex_t) * (n_pes + 1), cudaMemcpyDeviceToHost));
+    }
     local_com_num = part_community_offset[my_pe + 1] - part_community_offset[my_pe];
 
 

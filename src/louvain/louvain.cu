@@ -180,42 +180,42 @@ __device__ __forceinline__ weight_t move_gain<Objective::MapEquation>(
     return -dL;  // maximise the codelength decrease
 }
 
-// Directed map equation move gain (teleportation + flow, p_from_in approximated as 0).
-// e_to_m_norm = Σ_{v→w: w∈m} w(v,w)/s_out[v]  (transition probability into own module)
-// e_to_n_norm = Σ_{v→w: w∈n} w(v,w)/s_out[v]  (transition probability into candidate)
-// q_vis_{m,n} are passed as aci+ki and acj (already in probability units from PageRank).
-// qout_{m,n} and q_total are already in probability units (mass=1 in directed mode).
+// Directed map equation move gain using the proportional-teleportation objective:
+//   q_out[i] = τ·q_vis[i]·(1-q_vis[i]) + (1-τ)·q_walk_out[i]
+// consistent with apply_teleportation_q_out.
+//
+// e_to_m_norm = Σ_{v→w∈m} w(v,w)/s_out[v]  (normalised transition prob v→own module)
+// e_to_n_norm = Σ_{v→w∈n} w(v,w)/s_out[v]  (normalised transition prob v→candidate)
+// q_vis_{m,n}: probability units from PageRank (mass=1 in directed mode).
+// p_from_in ≈ 0: edges OTHER nodes in m had to v (now external after v leaves) are ignored.
 __device__ __forceinline__ weight_t move_gain_directed_approx(
-    weight_t p_vis_v,     // = ki
-    weight_t q_vis_m,     // = aci + ki
-    weight_t q_vis_n,     // = acj
-    weight_t qout_m,
-    weight_t qout_n,
-    weight_t q_total,
-    weight_t e_to_m_norm, // normalized transition prob from v to m
-    weight_t e_to_n_norm, // normalized transition prob from v to n
+    weight_t p_vis_v,     // = ki  (PageRank of v)
+    weight_t q_vis_m,     // = aci + ki  (q_vis[m] including v)
+    weight_t q_vis_n,     // = acj       (q_vis[n] before move)
+    weight_t qout_m,      // current q_out[m] (after apply_teleportation_q_out)
+    weight_t qout_n,      // current q_out[n]
+    weight_t q_total,     // Q = Σ_i q_out[i]
+    weight_t e_to_m_norm, // normalised transition prob from v to m
+    weight_t e_to_n_norm, // normalised transition prob from v to n
     double tau
 ) {
-    const double tv  = tau;
-    const double p   = (double)p_vis_v;
-    const double qm  = (double)q_vis_m;  // q_vis[m], includes v
-    const double qn  = (double)q_vis_n;
+    const double p  = (double)p_vis_v;
+    const double qm = (double)q_vis_m;  // q_vis[m] including v
+    const double qn = (double)q_vis_n;
     const double qom = (double)qout_m;
     const double qon = (double)qout_n;
     const double Qt  = (double)q_total;
+    const double tv  = tau;
+    const double em  = (double)e_to_m_norm;
+    const double en  = (double)e_to_n_norm;
 
-    // q_tau[i] = tau * q_vis[i] (uniform teleportation weights)
-    const double qt_m = tau * qm;
-    const double qt_n = tau * qn;
+    // Exact deltas for q_out[i]=τ·qv·(1-qv)+(1-τ)·qw when v moves from m to n.
+    // Δqw[m] ≈ -p·(1-em),  Δqw[n] ≈ +p·(1-en)  (p_from_in ≈ 0 approximation).
+    // Using d/dqv [τ·qv·(1-qv)] = τ·(1-2·qv) evaluated at the new q_vis:
+    const double dqm = tv * p * (2.0*qm - 1.0 - p) - (1.0-tv) * p * (1.0 - em);
+    const double dqn = tv * p * (1.0 - 2.0*qn - p) + (1.0-tv) * p * (1.0 - en);
 
-    // p_to_out[v,m] = p_vis[v] * (1 - e_to_m_norm)
-    const double pto_m = p * (1.0 - (double)e_to_m_norm);
-    const double pto_n = p * (1.0 - (double)e_to_n_norm);
-
-    const double dqm =  tv*(qm*tv - p*(1.0 - qt_m + tv)) + (1.0-tv)*(0.0 - pto_m);
-    const double dqn = -tv*(qn*tv - p*(1.0 - qt_n - tv)) - (1.0-tv)*(0.0 - pto_n);
-
-    // q_vis after the move: m loses v, n gains v
+    // q_vis after the move
     const double qvis_m_new = qm - p;
     const double qvis_n_new = qn + p;
 
@@ -353,10 +353,12 @@ compute_community_q_walk_out_local_atomic(
     }
 }
 
-// Directed map equation: apply teleportation correction to convert q_walk_out → q_out.
-// q_out[i] = (1-tau) * (tau*q_vis[i] + q_walk_out[i])
-// where q_vis[i] = shared_device_community_weight[i] (Σ p_vis in module i).
-// Writes directly into shared_device_community_q_out.
+// Directed map equation: convert q_walk_out → q_out using proportional teleportation.
+//   q_out[i] = τ·q_vis[i]·(1 - q_vis[i]) + (1-τ)·q_walk_out[i]
+// P(exit i via teleport | visiting i) = τ·(1-q_vis[i]) (proportional model: teleport target
+// is drawn proportional to ergodic visit probability, so fraction landing outside i = 1-q_vis[i]).
+// This gives q_out→0 for the all-in-one community (q_vis=1, q_walk=0) and q_out≈p_v for
+// singletons (q_vis=p_v≪1), guaranteeing L≥0 from compute_codelength.
 __global__ void __launch_bounds__(1024, 1)
 apply_teleportation_q_out(
     vertex_t local_vertices,
@@ -368,7 +370,8 @@ apply_teleportation_q_out(
     for (vertex_t i = (blockIdx.x * blockDim.x) + threadIdx.x; i < local_vertices; i += blockDim.x * gridDim.x) {
         weight_t q_vis  = shared_device_community_weight[i];
         weight_t q_walk = shared_device_community_q_out[i];
-        shared_device_community_q_out[i] = (weight_t)((1.0 - tau) * (tau * (double)q_vis + (double)q_walk));
+        shared_device_community_q_out[i] = (weight_t)(
+            tau * (double)q_vis * (1.0 - (double)q_vis) + (1.0 - tau) * (double)q_walk);
     }
 }
 
@@ -504,6 +507,13 @@ compute_codelength(
         weight_t q_raw = cl_reduce[0];
         weight_t Qp    = q_raw / mass;
         weight_t L     = plogp(Qp) - 2.0 * cl_reduce[1] - cl_reduce[3] + cl_reduce[2];
+        // The map-equation codelength is an entropy and must be >= 0. A negative value
+        // signals an invalid objective (e.g. a mis-derived directed q_out); surface it
+        // loudly instead of letting the driver chase a meaningless minimum.
+        if (L < -1.0e-6) {
+            printf("[WARN] compute_codelength: negative L=%.9f (q_raw=%.9f mass=%.9f) -- invalid objective\n",
+                   (double)L, (double)q_raw, (double)mass);
+        }
         Q[0]     = -L;      // score: the driver maximises this (== minimising L)
         Q_sum[0] =  q_raw;  // raw Sum_i cut_i, read by the gain kernels
     }
@@ -2254,8 +2264,11 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 
 
         // 4. Update the community id of each vertex (main loop)
-        // The presence of negative modularity leads to a direct termination of the cycle
-        while ((new_Q - cur_Q) > threshold) {
+        // The presence of negative modularity leads to a direct termination of the cycle.
+        // The `loop_num < max_iter` bound is a hard safety cap: it stops the loop from
+        // spinning forever if the objective fails to converge below `threshold` (which
+        // happened in directed mode when q_out was mis-derived and L drifted negative).
+        while ((new_Q - cur_Q) > threshold && loop_num < max_iter) {
 
             cur_Q = new_Q;
 
