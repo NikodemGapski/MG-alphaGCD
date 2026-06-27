@@ -2259,6 +2259,11 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         }
 
         bool up_down = true;
+        // Exit only after two consecutive non-improving iterations (one up_down=true, one
+        // up_down=false). Without this, directed graphs with tau≈0.15 exit after the first
+        // up_down=true pass because beneficial merges go to higher-ID communities — the
+        // up_down=false pass is never reached and the partition stays at the identity.
+        int consec_no_improve = 0;
 
         bins->bin_create(private_device_offset, local_vertices);
 
@@ -2268,7 +2273,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         // The `loop_num < max_iter` bound is a hard safety cap: it stops the loop from
         // spinning forever if the objective fails to converge below `threshold` (which
         // happened in directed mode when q_out was mis-derived and L drifted negative).
-        while ((new_Q - cur_Q) > threshold && loop_num < max_iter) {
+        while (consec_no_improve < 2 && loop_num < max_iter) {
 
             cur_Q = new_Q;
 
@@ -2358,8 +2363,10 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                                  shared_device_community_ids,
                                                                  local_vertices);
                 CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+                consec_no_improve = 0;
             } else {
                 new_Q = cur_Q;
+                consec_no_improve++;
             }
 
             loop_num++;
