@@ -1246,10 +1246,11 @@ void reorder_vertices(
     CUDA_RT_CALL(cudaMalloc((void **) &device_part_edge_offset, sizeof(edge_t) * (n_pes + 1)));
 
     // 1. partition edge based on com_degree
+    cudaGetLastError();  // clear NVSHMEM sticky error before CUB
     void     *d_temp_storage = NULL;
     size_t   temp_storage_bytes = 0;
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_degree + 1, com_degree + 1, global_com_num);
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    CUDA_RT_CALL(cudaMalloc(&d_temp_storage, (temp_storage_bytes > 0 ? temp_storage_bytes : 1)));
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_degree + 1, com_degree + 1, global_com_num);
     CUDA_RT_CALL(cudaFree(d_temp_storage));
 
@@ -1269,10 +1270,11 @@ void reorder_vertices(
                                                                                      part_community_offset[my_pe + 1]);
     CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
+    cudaGetLastError();  // clear NVSHMEM sticky error before CUB
     d_temp_storage = NULL;
     temp_storage_bytes = 0;
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_size + 2, com_size + 2, local_com_num);
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    CUDA_RT_CALL(cudaMalloc(&d_temp_storage, (temp_storage_bytes > 0 ? temp_storage_bytes : 1)));
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_size + 2, com_size + 2, local_com_num);
     CUDA_RT_CALL(cudaFree(d_temp_storage));
 
@@ -1310,10 +1312,11 @@ void reorder_vertices(
                                                                                      part_community_offset[my_pe + 1]);
     CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
+    cudaGetLastError();  // clear NVSHMEM sticky error before CUB
     void* d_temp_storage = NULL;
     size_t temp_storage_bytes = 0;
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_size + 2, com_size + 2, local_com_num);
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    CUDA_RT_CALL(cudaMalloc(&d_temp_storage, (temp_storage_bytes > 0 ? temp_storage_bytes : 1)));
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_size + 2, com_size + 2, local_com_num);
     CUDA_RT_CALL(cudaFree(d_temp_storage));
 
@@ -1343,11 +1346,18 @@ void renumber_community_id(
                                                                                  total_vertices);
     CUDA_RT_CALL(cudaStreamSynchronize(default_stream))
 
+    // Clear any sticky CUDA error left by NVSHMEM collective kernels before
+    // calling CUB, which internally calls cudaPeekAtLastError/cudaGetLastError
+    // and may inherit the sticky error, returning a wrong temp_storage_bytes=0
+    // (causing the actual scan to never run).
+    cudaGetLastError();
+
     void     *d_temp_storage = NULL;
     size_t   temp_storage_bytes = 0;
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_size, com_size, total_vertices);
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    CUDA_RT_CALL(cudaMalloc(&d_temp_storage, (temp_storage_bytes > 0 ? temp_storage_bytes : 1)));
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_size, com_size, total_vertices);
+    CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
     CUDA_RT_CALL(cudaFree(d_temp_storage));
 
     CUDA_RT_CALL(cudaMemcpy(&community_num, com_size + total_vertices - 1, sizeof(vertex_t), cudaMemcpyDeviceToHost));
@@ -1391,10 +1401,11 @@ void renumber_community_id_multi_gpu(
     CUDA_RT_CALL(cudaStreamSynchronize(default_stream))
 
     // 3. prefix sum to get new id of community
+    cudaGetLastError();  // clear NVSHMEM sticky error before CUB
     void     *d_temp_storage = NULL;
     size_t   temp_storage_bytes = 0;
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_size, com_size, local_vertices);
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    CUDA_RT_CALL(cudaMalloc(&d_temp_storage, (temp_storage_bytes > 0 ? temp_storage_bytes : 1)));
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_size, com_size, local_vertices);
     CUDA_RT_CALL(cudaFree(d_temp_storage));
 
@@ -1782,10 +1793,11 @@ void partition_communities(
     nvshmemx_barrier_all_on_stream(default_stream);
     CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
+    cudaGetLastError();  // clear NVSHMEM sticky error before CUB
     void     *d_temp_storage = NULL;
     size_t   temp_storage_bytes = 0;
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_degree + 1, com_degree + 1, global_com_num);
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    CUDA_RT_CALL(cudaMalloc(&d_temp_storage, (temp_storage_bytes > 0 ? temp_storage_bytes : 1)));
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, com_degree + 1, com_degree + 1, global_com_num);
     CUDA_RT_CALL(cudaFree(d_temp_storage));
     CUDA_RT_CALL(cudaMemcpy(&new_total_edges, com_degree + global_com_num, sizeof(vertex_t), cudaMemcpyDeviceToHost));
