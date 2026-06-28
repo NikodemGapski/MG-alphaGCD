@@ -1016,11 +1016,13 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
         tile.sync();
 
         if (tile.thread_rank() == 0) {
+            vertex_t final_dst;
             if (up_down) {
-                shared_device_community_ids_new_[vertex_id] = dst_community_id < src_community_id_copy ? dst_community_id : src_community_id_copy;
+                final_dst = dst_community_id < src_community_id_copy ? dst_community_id : src_community_id_copy;
             } else {
-                shared_device_community_ids_new_[vertex_id] = dst_community_id > src_community_id_copy ? dst_community_id : src_community_id_copy;
+                final_dst = dst_community_id > src_community_id_copy ? dst_community_id : src_community_id_copy;
             }
+            shared_device_community_ids_new_[vertex_id] = final_dst;
         }
 
         tile.sync();
@@ -2367,6 +2369,13 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
             } else {
                 new_Q = cur_Q;
                 consec_no_improve++;
+                // Rollback community_ids_new to the last accepted partition. Without this,
+                // the next iteration's step b) would apply the rejected partition's delta
+                // a second time, corrupting community_weight (it would double each rejection).
+                copy<vertex_t><<<128, 1024, 0, default_stream>>>(shared_device_community_ids,
+                                                                  shared_device_community_ids_new,
+                                                                  local_vertices);
+                CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
             }
 
             loop_num++;
