@@ -977,18 +977,28 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
                 if (directed) {
                     wij = move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total,
                                                     eici, hash_table_value[e], tau);
-                } else {
-                    wij = move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
-                }
-                if (up_down) {
-                    if ( (wij > best_modularity) || (wij == best_modularity && src_community_id < dst_community_id) ) {
+                    // For directed mode do not break ties by community ID: on unweighted
+                    // graphs every neighbour has identical gain, so ID tiebreaking causes
+                    // all vertices to pile to vertex-0 (up_down=true) or vertex-N
+                    // (up_down=false), creating one giant community that increases L.
+                    // Letting the hash-table insertion order decide (first-found wins)
+                    // creates a diverse, graph-structure-driven partition instead.
+                    if (wij > best_modularity) {
                         dst_community_id = src_community_id;
                         best_modularity = wij;
                     }
                 } else {
-                    if ( (wij > best_modularity) || (wij == best_modularity && src_community_id > dst_community_id) ) {
-                        dst_community_id = src_community_id;
-                        best_modularity = wij;
+                    wij = move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
+                    if (up_down) {
+                        if ( (wij > best_modularity) || (wij == best_modularity && src_community_id < dst_community_id) ) {
+                            dst_community_id = src_community_id;
+                            best_modularity = wij;
+                        }
+                    } else {
+                        if ( (wij > best_modularity) || (wij == best_modularity && src_community_id > dst_community_id) ) {
+                            dst_community_id = src_community_id;
+                            best_modularity = wij;
+                        }
                     }
                 }
             }
@@ -1000,7 +1010,12 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
         for (e = TILE_THREADS / 2; e > 0; e /= 2) {
             weight_t best_modularity_tmp = tile.shfl_down(best_modularity, e);    // available only for sizes lower or equal to 32
             vertex_t dst_community_id_tmp = tile.shfl_down(dst_community_id, e);
-            if (up_down) {
+            if (directed) {
+                if (best_modularity_tmp > best_modularity) {
+                    best_modularity = best_modularity_tmp;
+                    dst_community_id = dst_community_id_tmp;
+                }
+            } else if (up_down) {
                 if (best_modularity_tmp > best_modularity || (best_modularity_tmp == best_modularity && dst_community_id_tmp < dst_community_id)) {
                     best_modularity = best_modularity_tmp;
                     dst_community_id = dst_community_id_tmp;
@@ -1017,7 +1032,10 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
 
         if (tile.thread_rank() == 0) {
             vertex_t final_dst;
-            if (up_down) {
+            if (directed) {
+                // No ID-based gate for directed mode: accept any positive-gain move.
+                final_dst = dst_community_id;
+            } else if (up_down) {
                 final_dst = dst_community_id < src_community_id_copy ? dst_community_id : src_community_id_copy;
             } else {
                 final_dst = dst_community_id > src_community_id_copy ? dst_community_id : src_community_id_copy;
