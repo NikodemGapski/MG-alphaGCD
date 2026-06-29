@@ -2328,22 +2328,6 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 
             up_down = !up_down;
 
-            // [DIAG4] First directed iteration: count proposed moves and sample ids_new
-            if (phase_directed && loop_num == 0 && my_pe == 0) {
-                CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
-                vertex_t *h_ids     = new vertex_t[local_vertices];
-                vertex_t *h_ids_new = new vertex_t[local_vertices];
-                CUDA_RT_CALL(cudaMemcpy(h_ids,     shared_device_community_ids,     sizeof(vertex_t) * local_vertices, cudaMemcpyDeviceToHost));
-                CUDA_RT_CALL(cudaMemcpy(h_ids_new, shared_device_community_ids_new, sizeof(vertex_t) * local_vertices, cudaMemcpyDeviceToHost));
-                vertex_t n_moved = 0;
-                for (vertex_t i = 0; i < local_vertices; i++) if (h_ids_new[i] != h_ids[i]) n_moved++;
-                printf("[DIAG4] iter %d: %u/%u vertices proposed a move\n", loop_num, n_moved, local_vertices);
-                printf("[DIAG4] sample ids_new[0..9]: ");
-                for (int i = 0; i < 10 && i < (int)local_vertices; i++) printf("%u(%u) ", h_ids_new[i], h_ids[i]);
-                printf("\n");
-                delete[] h_ids; delete[] h_ids_new;
-            }
-
             nvshmem_barrier_all();
             CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
