@@ -2141,6 +2141,24 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     auto *cl_reduce = (weight_t *) nvshmem_malloc(4 * sizeof(weight_t));   // codelength reduction scratch
     CUDA_RT_CALL(cudaMemset(cl_reduce, 0, 4 * sizeof(weight_t)));
 
+    // --- Reject-staleness fix -------------------------------------------------
+    // community_weight / community_q_out / Q_sum are updated IN PLACE for the
+    // proposed partition (ids_new) every iteration (step b + step c). On a
+    // *rejected* iteration ids_new is rolled back to community_ids, but those
+    // three arrays are left holding the REJECTED proposal's values. The next
+    // iteration's move-gain kernels then read state that is inconsistent with
+    // community_ids, and the incremental step b accumulates from a wrong base
+    // (this is the other half of the bug commit cc7b73c only half-fixed by
+    // rolling back ids_new). We keep a backup of the state that is consistent
+    // with the last *accepted* partition and restore it on rejection.
+    const vertex_t max_total_vertices = total_vertices;   // original (largest) level
+    weight_t *cw_backup   = nullptr;   // community_weight  of last accepted partition
+    weight_t *cq_backup   = nullptr;   // community_q_out   of last accepted partition
+    weight_t *qsum_backup = nullptr;   // Q_sum (raw Sum_i cut) of last accepted partition
+    CUDA_RT_CALL(cudaMalloc((void **) &cw_backup,   max_total_vertices * sizeof(weight_t)));
+    CUDA_RT_CALL(cudaMalloc((void **) &cq_backup,   max_total_vertices * sizeof(weight_t)));
+    CUDA_RT_CALL(cudaMalloc((void **) &qsum_backup, sizeof(weight_t)));
+
     int block_dims = 1024;
     int grid_size = 0;
     size_t d_shared_mem = 0;
@@ -2272,6 +2290,18 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         cur_Q = new_Q - 1;
         phase_initial_score = new_Q;
 
+        // Seed the accepted-state backups with this phase's initial (singleton)
+        // partition state, which the initial codelength call above just produced.
+        CUDA_RT_CALL(cudaMemcpyAsync(cw_backup, shared_device_community_weight,
+                                     local_vertices * sizeof(weight_t),
+                                     cudaMemcpyDeviceToDevice, default_stream));
+        CUDA_RT_CALL(cudaMemcpyAsync(cq_backup, shared_device_community_q_out,
+                                     local_vertices * sizeof(weight_t),
+                                     cudaMemcpyDeviceToDevice, default_stream));
+        CUDA_RT_CALL(cudaMemcpyAsync(qsum_backup, Q_sum, sizeof(weight_t),
+                                     cudaMemcpyDeviceToDevice, default_stream));
+        CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
         if(my_pe == 0) {
             printf("| %-10s | %-10s | %-10s | %-10s | %-10s |\n", "Loop", "L(bits)", "dL", "time(s)", "time(ms)");
             printf("|------------|------------|------------|------------|------------|\n");
@@ -2384,6 +2414,17 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                                  local_vertices);
                 CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
                 consec_no_improve = 0;
+                // Accepted: the in-place community_weight/q_out/Q_sum now describe the
+                // new accepted partition (community_ids). Refresh the backups.
+                CUDA_RT_CALL(cudaMemcpyAsync(cw_backup, shared_device_community_weight,
+                                             local_vertices * sizeof(weight_t),
+                                             cudaMemcpyDeviceToDevice, default_stream));
+                CUDA_RT_CALL(cudaMemcpyAsync(cq_backup, shared_device_community_q_out,
+                                             local_vertices * sizeof(weight_t),
+                                             cudaMemcpyDeviceToDevice, default_stream));
+                CUDA_RT_CALL(cudaMemcpyAsync(qsum_backup, Q_sum, sizeof(weight_t),
+                                             cudaMemcpyDeviceToDevice, default_stream));
+                CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
             } else {
                 new_Q = cur_Q;
                 consec_no_improve++;
@@ -2393,6 +2434,18 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                 copy<vertex_t><<<128, 1024, 0, default_stream>>>(shared_device_community_ids,
                                                                   shared_device_community_ids_new,
                                                                   local_vertices);
+                CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+                // Rejected: community_weight/q_out/Q_sum still hold the REJECTED proposal's
+                // values. Restore the state consistent with community_ids so the next
+                // iteration's move-gains (and incremental step b) start from the right base.
+                CUDA_RT_CALL(cudaMemcpyAsync(shared_device_community_weight, cw_backup,
+                                             local_vertices * sizeof(weight_t),
+                                             cudaMemcpyDeviceToDevice, default_stream));
+                CUDA_RT_CALL(cudaMemcpyAsync(shared_device_community_q_out, cq_backup,
+                                             local_vertices * sizeof(weight_t),
+                                             cudaMemcpyDeviceToDevice, default_stream));
+                CUDA_RT_CALL(cudaMemcpyAsync(Q_sum, qsum_backup, sizeof(weight_t),
+                                             cudaMemcpyDeviceToDevice, default_stream));
                 CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
             }
 
@@ -2470,6 +2523,9 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 //        printf("Total phases: %d\n", phase_num++);
 //        printf("Total loops: %d\n", loop_total);
     }
+    CUDA_RT_CALL(cudaFree(cw_backup));
+    CUDA_RT_CALL(cudaFree(cq_backup));
+    CUDA_RT_CALL(cudaFree(qsum_backup));
     nvshmem_free(Q);
     nvshmem_free(Q_sum);
     nvshmem_free(cl_reduce);

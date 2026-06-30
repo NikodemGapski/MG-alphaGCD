@@ -1,5 +1,24 @@
 #include "../../include/partition/edge_partition.cuh"
 
+// Make the per-PE vertex boundaries strictly increasing with at least one vertex
+// per PE. The `split`/`edge_partition` kernels place interior boundary i+1 at the
+// vertex whose edge range [offset[v],offset[v+1]) contains the i-th edge split
+// point. When a hub vertex (e.g. vertex 0 of a coarsened graph) owns more than a
+// PE-share of the edges, the split point lands inside it and the boundary collapses
+// to that vertex -- handing some PE an empty [b,b) range, which then blocks forever
+// on the next NVSHMEM collective. Clamping here guarantees a non-empty partition
+// whenever total_vertices >= n_pes (the only case a per-PE split is well defined).
+static inline void clamp_part_offsets(vertex_t *part_offset, int n_pes, vertex_t total) {
+    part_offset[0] = 0;
+    part_offset[n_pes] = total;
+    for (int i = 1; i < n_pes; i++)
+        if (part_offset[i] <= part_offset[i - 1])
+            part_offset[i] = part_offset[i - 1] + 1;
+    for (int i = n_pes - 1; i >= 1; i--)
+        if (part_offset[i] >= part_offset[i + 1])
+            part_offset[i] = (part_offset[i + 1] > 0) ? part_offset[i + 1] - 1 : 0;
+}
+
 __global__ void
 split(vertex_t *device_offset, edge_t *device_part_edge_offset, vertex_t *device_part_vertex_offset, int n_pes,
       vertex_t total_vertices){
@@ -57,6 +76,11 @@ void edge_partition::partitioner(HostGraph *hostGraph, GpuGraph* gpuGraph, int n
 
     CUDA_RT_CALL(cudaMemcpy(part_vertex_offset, device_part_vertex_offset, sizeof(vertex_t) * (n_pes + 1),
                             cudaMemcpyDeviceToHost));
+
+    // Guarantee a non-empty, strictly increasing partition (see clamp_part_offsets).
+    clamp_part_offsets(part_vertex_offset, n_pes, total_vertices);
+    CUDA_RT_CALL(cudaMemcpy(device_part_vertex_offset, part_vertex_offset, sizeof(vertex_t) * (n_pes + 1),
+                            cudaMemcpyHostToDevice));
 
     edge_t max_local_edges = 0;
     for (int i = 0; i < n_pes; i++) {
@@ -171,6 +195,10 @@ void edge_partition::partitioner_intra_loop(HostGraph *hostGraph, GpuGraph* gpuG
     split<<<iDivUp(total_vertices, 256), 256>>>(private_device_offset, device_part_edge_offset, device_part_vertex_offset,
                                                 n_pes, total_vertices);
     CUDA_RT_CALL(cudaMemcpy(part_vertex_offset, device_part_vertex_offset, sizeof(vertex_t) * (n_pes + 1), cudaMemcpyDeviceToHost));
+
+    // Guarantee a non-empty, strictly increasing partition (see clamp_part_offsets).
+    clamp_part_offsets(part_vertex_offset, n_pes, total_vertices);
+    CUDA_RT_CALL(cudaMemcpy(device_part_vertex_offset, part_vertex_offset, sizeof(vertex_t) * (n_pes + 1), cudaMemcpyHostToDevice));
 
     gpuGraph->set_local_vertices_(part_vertex_offset[my_pe + 1] - part_vertex_offset[my_pe]);
     gpuGraph->set_local_edges_(hostGraph->get_host_offset_()[part_vertex_offset[my_pe + 1]] - hostGraph->get_host_offset_()[part_vertex_offset[my_pe]]);

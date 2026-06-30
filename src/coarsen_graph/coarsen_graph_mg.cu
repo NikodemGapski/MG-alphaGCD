@@ -1822,6 +1822,21 @@ void partition_communities(
                                                                    global_com_num);
         CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
         CUDA_RT_CALL(cudaMemcpy(part_community_offset, device_part_community_offset, sizeof(vertex_t) * (n_pes + 1), cudaMemcpyDeviceToHost));
+
+        // Guarantee a non-empty, strictly increasing community partition. The
+        // edge_partition kernel can place an interior boundary at community 0 (a
+        // hub super-node owning > 1/n_pes of the coarse edges) or collapse two
+        // boundaries onto one community, handing some PE an empty range that then
+        // deadlocks the next coarsening collective (the -np 2 hang). Clamp it.
+        part_community_offset[0] = 0;
+        part_community_offset[n_pes] = global_com_num;
+        for (int i = 1; i < n_pes; i++)
+            if (part_community_offset[i] <= part_community_offset[i - 1])
+                part_community_offset[i] = part_community_offset[i - 1] + 1;
+        for (int i = n_pes - 1; i >= 1; i--)
+            if (part_community_offset[i] >= part_community_offset[i + 1])
+                part_community_offset[i] = (part_community_offset[i + 1] > 0) ? part_community_offset[i + 1] - 1 : 0;
+        CUDA_RT_CALL(cudaMemcpy(device_part_community_offset, part_community_offset, sizeof(vertex_t) * (n_pes + 1), cudaMemcpyHostToDevice));
     }
     local_com_num = part_community_offset[my_pe + 1] - part_community_offset[my_pe];
 
