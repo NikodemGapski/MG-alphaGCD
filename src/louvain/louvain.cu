@@ -186,8 +186,19 @@ __device__ __forceinline__ weight_t move_gain<Objective::MapEquation>(
 //
 // e_to_m_norm = Σ_{v→w∈m} w(v,w)/s_out[v]  (normalised transition prob v→own module)
 // e_to_n_norm = Σ_{v→w∈n} w(v,w)/s_out[v]  (normalised transition prob v→candidate)
+// in_m_flow   = Σ_{u→v, u∈m} p[u]·w(u,v)/s_out[u]  (walk in-flow into v from own module)
+// in_n_flow   = Σ_{u→v, u∈n} p[u]·w(u,v)/s_out[u]  (walk in-flow into v from candidate)
 // q_vis_{m,n}: probability units from PageRank (mass=1 in directed mode).
-// p_from_in ≈ 0: edges OTHER nodes in m had to v (now external after v leaves) are ignored.
+//
+// EXACT walk-out deltas (verified vs brute-force ΔL to ~1e-15, see
+// tools/directed_gain_check.py): when v leaves m, the edges OTHER nodes of m had
+// INTO v stop being internal -> q_walk_out[m] gains in_m_flow; symmetrically the
+// edges nodes of n have into v become internal -> q_walk_out[n] loses in_n_flow.
+//   Δqw[m] = -p·(1-em) + in_m_flow,   Δqw[n] = +p·(1-en) - in_n_flow
+// The previous code dropped both in_*_flow terms ("p_from_in ≈ 0"); that made the
+// gain disagree with ΔL on the *sign* of the move ~34% of the time at τ=0.15,
+// which is the directed-τ<0.5 "stuck at identity" failure. Pass in_*_flow=0 to
+// recover the old approximation.
 __device__ __forceinline__ weight_t move_gain_directed_approx(
     weight_t p_vis_v,     // = ki  (PageRank of v)
     weight_t q_vis_m,     // = aci + ki  (q_vis[m] including v)
@@ -197,7 +208,9 @@ __device__ __forceinline__ weight_t move_gain_directed_approx(
     weight_t q_total,     // Q = Σ_i q_out[i]
     weight_t e_to_m_norm, // normalised transition prob from v to m
     weight_t e_to_n_norm, // normalised transition prob from v to n
-    double tau
+    double tau,
+    weight_t in_m_flow = 0.,   // walk in-flow into v from m  (0 = old approximation)
+    weight_t in_n_flow = 0.    // walk in-flow into v from n
 ) {
     const double p  = (double)p_vis_v;
     const double qm = (double)q_vis_m;  // q_vis[m] including v
@@ -208,12 +221,13 @@ __device__ __forceinline__ weight_t move_gain_directed_approx(
     const double tv  = tau;
     const double em  = (double)e_to_m_norm;
     const double en  = (double)e_to_n_norm;
+    const double im  = (double)in_m_flow;
+    const double in_ = (double)in_n_flow;
 
     // Exact deltas for q_out[i]=τ·qv·(1-qv)+(1-τ)·qw when v moves from m to n.
-    // Δqw[m] ≈ -p·(1-em),  Δqw[n] ≈ +p·(1-en)  (p_from_in ≈ 0 approximation).
-    // Using d/dqv [τ·qv·(1-qv)] = τ·(1-2·qv) evaluated at the new q_vis:
-    const double dqm = tv * p * (2.0*qm - 1.0 - p) - (1.0-tv) * p * (1.0 - em);
-    const double dqn = tv * p * (1.0 - 2.0*qn - p) + (1.0-tv) * p * (1.0 - en);
+    // Δqw[m] = -p·(1-em) + in_m_flow,  Δqw[n] = +p·(1-en) - in_n_flow.
+    const double dqm = tv * p * (2.0*qm - 1.0 - p) - (1.0-tv) * (p * (1.0 - em) - im);
+    const double dqn = tv * p * (1.0 - 2.0*qn - p) + (1.0-tv) * (p * (1.0 - en) - in_);
 
     // q_vis after the move
     const double qvis_m_new = qm - p;
