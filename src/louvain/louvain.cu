@@ -857,7 +857,10 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
     vertex_t bin_offset,
     vertex_t* bin_permutation,
     weight_t* s_out_local,   // nullptr = undirected; local-index s_out array (NVSHMEM)
-    double tau               // teleportation probability (ignored when s_out_local==nullptr)
+    double tau,              // teleportation probability (ignored when s_out_local==nullptr)
+    vertex_t* in_offset,     // directed in-CSR (local-indexed); in_edge holds GLOBAL src ids
+    edge_t* in_edge,
+    weight_t* in_edge_weight
 )
 {
     int hash_len_tile = TILE_THREADS;   // the size of hash table that each tile has
@@ -901,6 +904,8 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
 
     vertex_t* hash_table_key = (vertex_t*) shared_memory;
     weight_t* hash_table_value = (weight_t*) &hash_table_key[(block.num_threads() / TILE_THREADS) * hash_len_tile];
+    // parallel slot array: walk in-flow into v from each candidate community (directed)
+    weight_t* hash_table_in_value = (weight_t*) &hash_table_value[(block.num_threads() / TILE_THREADS) * hash_len_tile];
 
 
     for (tile_id = tile_id_grid; tile_id < bin_size; tile_id += tile_num_grid) {
@@ -912,12 +917,14 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
         src_community_id_copy = src_community_id;
         weight_t ki =  private_device_vertex_weight[vertex_id];
         weight_t sv = directed ? s_out_local[vertex_id] : (weight_t)1.0;
+        weight_t in_m = 0.;   // walk in-flow into v from its OWN module (directed)
         edge_lb = private_device_offset[vertex_id];
         edge_rb = private_device_offset[vertex_id + 1];
 
         for (e = hash_table_lb + tile.thread_rank(); e < hash_table_rb; e += TILE_THREADS) {
             hash_table_key[e] = UINT32_MAX;
             hash_table_value[e] = 0.;
+            hash_table_in_value[e] = 0.;
         }
 
         tile.sync();
@@ -971,6 +978,39 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
         // reduce eici
         eici = cg::reduce(tile, eici, cg::plus<weight_t>());
 
+        // Directed: accumulate the walk in-flow into v from each module, so the gain
+        // can use the EXACT q_walk_out deltas (see move_gain_directed_approx). For each
+        // local in-neighbour u: contrib = p[u]*w(u,v)/s_out[u]; route by comm[u] into the
+        // own-module scalar in_m, or (via hash LOOKUP, never insert -> no overflow) into
+        // the candidate slot's in-value. Remote in-neighbours lack a symmetric p[u] and
+        // are skipped (exact at -np 1, the directed regime that is actually used).
+        if (directed) {
+            for (e = in_offset[vertex_id] + tile.thread_rank(); e < in_offset[vertex_id + 1]; e += TILE_THREADS) {
+                vertex_t u = in_edge[e];
+                int pe_u; locating_vertex(pe_u, u, private_device_part_vertex_offset, n_pes);
+                if (pe_u != my_pe) continue;
+                weight_t su = s_out_local[u];
+                if (su <= 0.) continue;
+                weight_t contrib = (weight_t)((double)private_device_vertex_weight[u]
+                                              * (double)in_edge_weight[e] / (double)su);
+                vertex_t cu = shared_device_community_ids[u];
+                if (cu == src_community_id_copy) {
+                    in_m += contrib;
+                } else {
+                    vertex_t h = (vertex_t)(((long long unsigned)cu * 107) % (hash_table_rb - hash_table_lb));
+                    while (hash_table_key[hash_table_lb + h] != UINT32_MAX) {
+                        if (hash_table_key[hash_table_lb + h] == cu) {
+                            atomicAdd(hash_table_in_value + hash_table_lb + h, contrib);
+                            break;
+                        }
+                        h = (h + 1) % (hash_table_rb - hash_table_lb);
+                    }
+                }
+            }
+            tile.sync();
+            in_m = cg::reduce(tile, in_m, cg::plus<weight_t>());
+        }
+
         dst_community_id = src_community_id;
 
         // move vertex based on best modularity gain
@@ -990,7 +1030,8 @@ __global__ void calculate_eicj_and_move_vertex_sh_tile(
 
                 if (directed) {
                     wij = move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total,
-                                                    eici, hash_table_value[e], tau);
+                                                    eici, hash_table_value[e], tau,
+                                                    in_m, hash_table_in_value[e]);
                     // For directed mode do not break ties by community ID: on unweighted
                     // graphs every neighbour has identical gain, so ID tiebreaking causes
                     // all vertices to pile to vertex-0 (up_down=true) or vertex-N
@@ -1083,7 +1124,10 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
     vertex_t* bin_permutation,
     vertex_t total_vertices,
     weight_t* s_out_local,
-    double tau
+    double tau,
+    vertex_t* in_offset,     // directed in-CSR (local-indexed); in_edge holds GLOBAL src ids
+    edge_t* in_edge,
+    weight_t* in_edge_weight
     )
 {
     cg::grid_group grid = cg::this_grid();
@@ -1115,12 +1159,15 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
 
     __shared__ vertex_t hash_table_key[HASH_LEN];
     __shared__ weight_t hash_table_value[HASH_LEN];
-    __shared__ weight_t reduce_buffer[3];
+    __shared__ weight_t hash_table_in_value[HASH_LEN];   // directed walk in-flow per slot
+    __shared__ weight_t reduce_buffer[4];                // [3] = in_m (own-module in-flow)
 
     for (e = block.thread_rank(); e < HASH_LEN; e += block.num_threads()) {
         hash_table_key[e] = UINT32_MAX;
         hash_table_value[e] = 0.;
+        hash_table_in_value[e] = 0.;
     }
+    if (block.thread_rank() == 0) reduce_buffer[3] = 0.;
 
     if(vertex_id >= bin_size) return;
 
@@ -1190,6 +1237,35 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
 
     eici = reduce_buffer[1];
 
+    // Directed: accumulate walk in-flow into v (own module -> reduce_buffer[3]; candidate
+    // modules -> hash_table_in_value via lookup, never insert). Local in-neighbours only.
+    if (directed) {
+        weight_t in_m_local = 0.;
+        for (e = in_offset[vertex_id] + block.thread_rank(); e < in_offset[vertex_id + 1]; e += block.num_threads()) {
+            vertex_t u = in_edge[e];
+            int pe_u; locating_vertex(pe_u, u, private_device_part_vertex_offset, n_pes);
+            if (pe_u != my_pe) continue;
+            weight_t su = s_out_local[u];
+            if (su <= 0.) continue;
+            weight_t contrib = (weight_t)((double)private_device_vertex_weight[u]
+                                          * (double)in_edge_weight[e] / (double)su);
+            vertex_t cu = shared_device_community_ids[u];
+            if (cu == src_community_id_copy) {
+                in_m_local += contrib;
+            } else {
+                vertex_t h = (vertex_t)(((long long unsigned)cu * 107) % HASH_LEN);
+                while (hash_table_key[h] != UINT32_MAX) {
+                    if (hash_table_key[h] == cu) { atomicAdd(hash_table_in_value + h, contrib); break; }
+                    h = (h + 1) % HASH_LEN;
+                }
+            }
+        }
+        in_m_local = cg::reduce(tile32, in_m_local, cg::plus<weight_t>());
+        if (tile32.thread_rank() == 0) atomicAdd(reduce_buffer + 3, in_m_local);
+        block.sync();
+    }
+    weight_t in_m = reduce_buffer[3];
+
     dst_community_id = src_community_id;
 
     // move vertex based on best modularity gain
@@ -1208,7 +1284,7 @@ __global__ void calculate_eicj_and_move_vertex_sh_bk(
             }
 
             wij = directed
-                ? move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total, eici, hash_table_value[e], tau)
+                ? move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total, eici, hash_table_value[e], tau, in_m, hash_table_in_value[e])
                 : move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
             // Add a constraint: when the best score is the same, choose the one with the smallest ID.
             if (up_down) {
@@ -1311,6 +1387,7 @@ calculate_eicj_and_move_vertex_gl_bk(
     weight_t* Q_sum,
     vertex_t* hash_table_key,
     weight_t* hash_table_value,
+    weight_t* hash_table_in_value,   // global walk in-flow per slot (directed)
     weight_t mass,
     int my_pe,
     int n_pes,
@@ -1320,7 +1397,10 @@ calculate_eicj_and_move_vertex_gl_bk(
     vertex_t* bin_permutation,
     edge_t HASH_LEN,
     weight_t* s_out_local,
-    double tau
+    double tau,
+    vertex_t* in_offset,     // directed in-CSR (local-indexed); in_edge holds GLOBAL src ids
+    edge_t* in_edge,
+    weight_t* in_edge_weight
 )
 {
     cg::grid_group grid = cg::this_grid();
@@ -1353,6 +1433,7 @@ calculate_eicj_and_move_vertex_gl_bk(
 
     __shared__ vertex_t buffer_int[1024/32];
     __shared__ weight_t buffer_double[1024/32];
+    __shared__ weight_t in_m_buf;     // own-module walk in-flow (directed)
 
     vertex_t hash_table_lb = block.group_index().x * HASH_LEN;
 
@@ -1370,7 +1451,9 @@ calculate_eicj_and_move_vertex_gl_bk(
         for (e = block.thread_rank(); e < HASH_LEN; e += block.num_threads()) {
             hash_table_key[hash_table_lb + e] = UINT32_MAX;
             hash_table_value[hash_table_lb + e] = 0.;
+            hash_table_in_value[hash_table_lb + e] = 0.;
         }
+        if (block.thread_rank() == 0) in_m_buf = 0.;
         block.sync();
 
         if (block.thread_rank() == 0) {
@@ -1431,6 +1514,35 @@ calculate_eicj_and_move_vertex_gl_bk(
 
         eici = buffer_double[1];
 
+        // Directed: accumulate walk in-flow into v (own module -> in_m_buf; candidate
+        // modules -> hash_table_in_value via lookup, never insert). Local in-neighbours only.
+        if (directed) {
+            weight_t in_m_local = 0.;
+            for (e = in_offset[vertex_id] + block.thread_rank(); e < in_offset[vertex_id + 1]; e += block.num_threads()) {
+                vertex_t u = in_edge[e];
+                int pe_u; locating_vertex(pe_u, u, private_device_part_vertex_offset, n_pes);
+                if (pe_u != my_pe) continue;
+                weight_t su = s_out_local[u];
+                if (su <= 0.) continue;
+                weight_t contrib = (weight_t)((double)private_device_vertex_weight[u]
+                                              * (double)in_edge_weight[e] / (double)su);
+                vertex_t cu = shared_device_community_ids[u];
+                if (cu == src_community_id_copy) {
+                    in_m_local += contrib;
+                } else {
+                    vertex_t h = (vertex_t)(((long long unsigned)cu * 107) % HASH_LEN);
+                    while (hash_table_key[hash_table_lb + h] != UINT32_MAX) {
+                        if (hash_table_key[hash_table_lb + h] == cu) { atomicAdd(hash_table_in_value + hash_table_lb + h, contrib); break; }
+                        h = (h + 1) % HASH_LEN;
+                    }
+                }
+            }
+            in_m_local = cg::reduce(tile32, in_m_local, cg::plus<weight_t>());
+            if (tile32.thread_rank() == 0) atomicAdd(&in_m_buf, in_m_local);
+            block.sync();
+        }
+        weight_t in_m = in_m_buf;
+
         dst_community_id = src_community_id;
 
 //         move vertex based on best modularity gain
@@ -1449,7 +1561,7 @@ calculate_eicj_and_move_vertex_gl_bk(
                 }
 
                 wij = directed
-                    ? move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total, eici, hash_table_value[e], tau)
+                    ? move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total, eici, hash_table_value[e], tau, in_m, hash_table_in_value[e])
                     : move_gain<ACTIVE_OBJECTIVE>(hash_table_value[e], eici, ki, aci, acj, qout_m, qout_n, q_total, mass);
                 // Add a constraint: when the best score is the same, choose the one with the smallest ID.
                 if (up_down) {
@@ -1556,7 +1668,12 @@ void calculate_eicj_and_move_vertex_bin(
     vertex_t total_vertices,
     cudaStream_t default_stream,
     weight_t* s_out_local,   // nullptr = undirected
-    double tau               // ignored when s_out_local == nullptr
+    double tau,              // ignored when s_out_local == nullptr
+    // directed in-CSR (local-indexed) for the exact walk-in-flow gain correction;
+    // nullptr in undirected mode. in_edge[] holds GLOBAL source ids.
+    vertex_t* in_offset = nullptr,
+    edge_t* in_edge = nullptr,
+    weight_t* in_edge_weight = nullptr
 ){
     int grid_num;
     int block_num;
@@ -1564,6 +1681,7 @@ void calculate_eicj_and_move_vertex_bin(
 
     vertex_t * hash_table_key = nullptr;
     weight_t * hash_table_value = nullptr;
+    weight_t * hash_table_in_value = nullptr;   // global walk in-flow per slot (directed gl_bk)
 
     for (int i = BIN_NUM - 1; i >= 0; i--) {
         if (bins->bin_size[i] > 0) {
@@ -1572,7 +1690,7 @@ void calculate_eicj_and_move_vertex_bin(
                     // tile2 for a vertex whose #edges is less than 2
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 2);
-                    d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
+                    d_shared_mem = sizeof(vertex_t) * block_num + 2 * sizeof(weight_t) * block_num;  // +1 weight_t/slot for in-flow
                     calculate_eicj_and_move_vertex_sh_tile<2><<<grid_num, block_num, d_shared_mem, streams[0]>>>(
                             begin_vertex_id,
                             private_device_offset, private_device_edge, private_device_edge_weight,
@@ -1581,13 +1699,13 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            s_out_local, tau);
+                            s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
                 case 1:
                     // tile4 for a vertex whose #edges is less than 4
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 4);
-                    d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
+                    d_shared_mem = sizeof(vertex_t) * block_num + 2 * sizeof(weight_t) * block_num;  // +1 weight_t/slot for in-flow
                     calculate_eicj_and_move_vertex_sh_tile<4><<<grid_num, block_num, d_shared_mem, streams[1]>>>(
                             begin_vertex_id,
                             private_device_offset, private_device_edge, private_device_edge_weight,
@@ -1596,13 +1714,13 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            s_out_local, tau);
+                            s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
                 case 2:
                     // tile8 for a vertex whose #edges is less than 8
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 8);
-                    d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
+                    d_shared_mem = sizeof(vertex_t) * block_num + 2 * sizeof(weight_t) * block_num;  // +1 weight_t/slot for in-flow
                     calculate_eicj_and_move_vertex_sh_tile<8><<<grid_num, block_num, d_shared_mem, streams[2]>>>(
                             begin_vertex_id,
                             private_device_offset, private_device_edge, private_device_edge_weight,
@@ -1611,13 +1729,13 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            s_out_local, tau);
+                            s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
                 case 3:
                     // tile16 for a vertex whose #edges is less than 16
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 16);
-                    d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
+                    d_shared_mem = sizeof(vertex_t) * block_num + 2 * sizeof(weight_t) * block_num;  // +1 weight_t/slot for in-flow
                     calculate_eicj_and_move_vertex_sh_tile<16><<<grid_num, block_num, d_shared_mem, streams[3]>>>(
                             begin_vertex_id,
                             private_device_offset, private_device_edge, private_device_edge_weight,
@@ -1626,14 +1744,14 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            s_out_local, tau);
+                            s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
 
                 case 4:
                     // tile32 for a vertex whose #edges is less than 32
                     block_num = 512;
                     grid_num = iDivUp(bins->bin_size[i], block_num / 32);
-                    d_shared_mem = sizeof(vertex_t) * block_num + sizeof(weight_t) * block_num;
+                    d_shared_mem = sizeof(vertex_t) * block_num + 2 * sizeof(weight_t) * block_num;  // +1 weight_t/slot for in-flow
                     calculate_eicj_and_move_vertex_sh_tile<32><<<grid_num, block_num, d_shared_mem, streams[4]>>>(
                             begin_vertex_id,
                             private_device_offset, private_device_edge, private_device_edge_weight,
@@ -1642,7 +1760,7 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            s_out_local, tau);
+                            s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
                 case 5:
                     block_num = 128;
@@ -1655,7 +1773,7 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            total_vertices, s_out_local, tau);
+                            total_vertices, s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
                 case 6:
                     block_num = 512;
@@ -1668,7 +1786,7 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            total_vertices, s_out_local, tau);
+                            total_vertices, s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
                 case 7:
                     block_num = 1024;
@@ -1681,7 +1799,7 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            total_vertices, s_out_local, tau);
+                            total_vertices, s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
                 case 8:
                     block_num = 1024;
@@ -1694,7 +1812,7 @@ void calculate_eicj_and_move_vertex_bin(
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            total_vertices, s_out_local, tau);
+                            total_vertices, s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
                 case 9:
                     int SMs = 80;
@@ -1703,6 +1821,7 @@ void calculate_eicj_and_move_vertex_bin(
                     vertex_t len_hash_table = hash_table_num * max_degree;
                     CUDA_RT_CALL(cudaMalloc((void **) &hash_table_key, sizeof(vertex_t) * len_hash_table));
                     CUDA_RT_CALL(cudaMalloc((void **) &hash_table_value, sizeof(weight_t) * len_hash_table));
+                    CUDA_RT_CALL(cudaMalloc((void **) &hash_table_in_value, sizeof(weight_t) * len_hash_table));
                     grid_num = hash_table_num;
                     block_num = 1024;
                     calculate_eicj_and_move_vertex_gl_bk<<<grid_num, block_num, 0, streams[9]>>>(
@@ -1711,10 +1830,10 @@ void calculate_eicj_and_move_vertex_bin(
                             private_device_vertex_weight, private_device_part_vertex_offset,
                             shared_device_community_ids_new, shared_device_community_ids,
                             shared_device_community_weight, shared_device_community_q_out, Q_sum,
-                            hash_table_key, hash_table_value,
+                            hash_table_key, hash_table_value, hash_table_in_value,
                             mass, my_pe, n_pes, up_down,
                             bins->bin_size[i], bins->bin_offset[i], bins->device_bin_permutation,
-                            max_degree, s_out_local, tau);
+                            max_degree, s_out_local, tau, in_offset, in_edge, in_edge_weight);
                     break;
             }
         }
@@ -1726,6 +1845,7 @@ void calculate_eicj_and_move_vertex_bin(
 
     CUDA_RT_CALL(cudaFree(hash_table_key));
     CUDA_RT_CALL(cudaFree(hash_table_value));
+    CUDA_RT_CALL(cudaFree(hash_table_in_value));
 }
 
 
@@ -2366,7 +2486,10 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                total_vertices,
                                                default_stream,
                                                phase_directed ? pr_s_out : nullptr,
-                                               phase_directed ? tau : 0.0);
+                                               phase_directed ? tau : 0.0,
+                                               phase_directed ? pr_in_offset : nullptr,
+                                               phase_directed ? pr_in_edge : nullptr,
+                                               phase_directed ? pr_in_edge_weight : nullptr);
 
 
 
