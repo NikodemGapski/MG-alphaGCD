@@ -1661,6 +1661,273 @@ calculate_eicj_and_move_vertex_gl_bk(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Clean local-moving kernel: ONE WARP PER VERTEX.
+//
+// The binned tile/block kernels above compute the right thing *on paper* --
+// tools/kernel_emulator.py reimplements their exact logic (bin capacities, the
+// (c*107)%size hash with linear probing, the per-lane slot scan, the tree reduction and
+// its ID tie-break, the up_down gate) and reproduces the CPU reference: from singletons
+// wiki-Vote reaches L=11.433430 / 1224 communities after pass 1. The GPU instead reaches
+// L=12.268406 and then collapses to the all-in-one basin, so it is diverging from its own
+// source semantics at runtime (a race / UB), not computing a different algorithm.
+//
+// This kernel deliberately removes every mechanism that could be responsible:
+//   * one warp per vertex -- no sub-warp cooperative tiles,
+//   * hash table in GLOBAL memory, slice [2*offset[v], 2*offset[v+1]) -- capacity 2*deg(v),
+//     so it is at most half full and probing can never wrap into another vertex's slots,
+//   * no reuse of the hash storage as reduction scratch,
+//   * a single launch on one stream -- no 10 concurrent per-bin kernels.
+// It is otherwise semantically identical to the binned path (same gain, same tie-breaks,
+// same up_down gate), so the two can be A/B'd with -move.
+__global__ void __launch_bounds__(256, 1)
+move_vertices_warp(
+    vertex_t begin_vertex_id,
+    vertex_t local_vertices,
+    vertex_t* private_device_offset,
+    edge_t* private_device_edge,
+    weight_t* private_device_edge_weight,
+    weight_t* private_device_vertex_weight,
+    vertex_t* private_device_part_vertex_offset,
+    vertex_t* shared_device_community_ids_new_,
+    vertex_t* shared_device_community_ids,
+    weight_t* shared_device_community_weight,
+    weight_t* shared_device_community_q_out,
+    weight_t* Q_sum,
+    vertex_t* hash_key,        // global scratch, 2 * local_edges entries
+    weight_t* hash_val,
+    weight_t* hash_in_val,
+    weight_t mass,
+    int my_pe,
+    int n_pes,
+    bool up_down,
+    weight_t* s_out_local,     // nullptr = undirected
+    double tau,
+    vertex_t* in_offset,       // directed in-CSR (local-indexed; in_edge holds GLOBAL ids)
+    edge_t* in_edge,
+    weight_t* in_edge_weight
+)
+{
+    cg::grid_group grid = cg::this_grid();
+    cg::thread_block block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+
+    const bool directed = (s_out_local != nullptr);
+    if (!directed) mass = mass / 2.0;   // undirected passes m; move_gain re-doubles it
+    const weight_t q_total = Q_sum[0];
+
+    const int warps_in_grid = grid.num_threads() / 32;
+    const int warp_id_grid  = grid.thread_rank() / 32;
+
+    for (vertex_t v = warp_id_grid; v < local_vertices; v += warps_in_grid) {
+        const edge_t edge_lb = private_device_offset[v];
+        const edge_t edge_rb = private_device_offset[v + 1];
+        const vertex_t src_community_id = shared_device_community_ids[v];
+
+        // Isolated vertex: no neighbours, so no candidate community. It must stay put.
+        if (edge_lb == edge_rb) {
+            if (warp.thread_rank() == 0) shared_device_community_ids_new_[v] = src_community_id;
+            continue;
+        }
+
+        const edge_t hash_lb = edge_lb * 2;
+        const edge_t hash_rb = edge_rb * 2;
+        const vertex_t hash_size = (vertex_t)(hash_rb - hash_lb);   // = 2*deg(v)
+
+        for (edge_t s = hash_lb + warp.thread_rank(); s < hash_rb; s += 32) {
+            hash_key[s]    = UINT32_MAX;
+            hash_val[s]    = 0.;
+            hash_in_val[s] = 0.;
+        }
+        warp.sync();
+
+        const weight_t ki = private_device_vertex_weight[v];
+        const weight_t sv = directed ? s_out_local[v] : (weight_t)1.0;
+
+        // Gather the weight from v to each neighbouring community (hash), and to its own
+        // community (eici). Self-loops are excluded from eici, as in compute_codelength.
+        weight_t eici = 0.;
+        for (edge_t e = edge_lb + warp.thread_rank(); e < edge_rb; e += 32) {
+            vertex_t neighbor_id = private_device_edge[e];
+            int pe_dst;
+            locating_vertex(pe_dst, neighbor_id, private_device_part_vertex_offset, n_pes);
+            const vertex_t dst_community_id = (pe_dst == my_pe)
+                ? shared_device_community_ids[neighbor_id]
+                : nvshmem_uint32_g(shared_device_community_ids + neighbor_id, pe_dst);
+
+            const weight_t w = private_device_edge_weight[e];
+            const weight_t w_norm = (directed && sv > 0.) ? w / sv : w;
+
+            if (dst_community_id != src_community_id) {
+                vertex_t h = (vertex_t)(((unsigned long long)dst_community_id * 107ULL) % hash_size);
+                while (true) {
+                    const vertex_t old = atomicCAS(hash_key + hash_lb + h, UINT32_MAX, dst_community_id);
+                    if (old == UINT32_MAX || old == dst_community_id) {
+                        atomicAdd(hash_val + hash_lb + h, w_norm);
+                        break;
+                    }
+                    h = (h + 1) % hash_size;   // at most half full -> always terminates
+                }
+            } else if (private_device_edge[e] != v + begin_vertex_id) {
+                eici += w_norm;
+            }
+        }
+        eici = cg::reduce(warp, eici, cg::plus<weight_t>());
+        warp.sync();
+
+        // Directed: walk in-flow into v from each module. Look up (never insert) so the
+        // table cannot overflow. Remote in-neighbours have no symmetric p[u]; skip them
+        // (exact at -np 1). Own-module in-flow is reduced into in_m.
+        weight_t in_m = 0.;
+        if (directed) {
+            for (edge_t e = in_offset[v] + warp.thread_rank(); e < in_offset[v + 1]; e += 32) {
+                vertex_t u = in_edge[e];
+                int pe_u;
+                locating_vertex(pe_u, u, private_device_part_vertex_offset, n_pes);
+                if (pe_u != my_pe) continue;
+                const weight_t su = s_out_local[u];
+                if (su <= 0.) continue;
+                const weight_t contrib = (weight_t)((double)private_device_vertex_weight[u]
+                                                    * (double)in_edge_weight[e] / (double)su);
+                const vertex_t cu = shared_device_community_ids[u];
+                if (cu == src_community_id) {
+                    in_m += contrib;
+                } else {
+                    vertex_t h = (vertex_t)(((unsigned long long)cu * 107ULL) % hash_size);
+                    while (hash_key[hash_lb + h] != UINT32_MAX) {
+                        if (hash_key[hash_lb + h] == cu) {
+                            atomicAdd(hash_in_val + hash_lb + h, contrib);
+                            break;
+                        }
+                        h = (h + 1) % hash_size;
+                    }
+                }
+            }
+            in_m = cg::reduce(warp, in_m, cg::plus<weight_t>());
+        }
+        warp.sync();
+
+        // community ids are GLOBAL (init_community_id writes the global vertex id), so the
+        // owning PE has to be resolved before indexing the symmetric arrays.
+        vertex_t src_local = src_community_id;
+        int pe_src;
+        locating_vertex(pe_src, src_local, private_device_part_vertex_offset, n_pes);
+        weight_t aci, qout_m;
+        if (pe_src == my_pe) {
+            aci    = shared_device_community_weight[src_local];
+            qout_m = shared_device_community_q_out[src_local];
+        } else {
+            aci    = nvshmem_double_g(shared_device_community_weight + src_local, pe_src);
+            qout_m = nvshmem_double_g(shared_device_community_q_out + src_local, pe_src);
+        }
+        aci -= ki;   // move_gain expects vol(m) - k_v
+
+        // Score every candidate community; each lane scans its own stride of slots.
+        weight_t best_gain = 0.;                    // only strictly-improving moves are taken
+        vertex_t best_dst  = src_community_id;
+        for (edge_t s = hash_lb + warp.thread_rank(); s < hash_rb; s += 32) {
+            const vertex_t cand = hash_key[s];
+            if (cand == UINT32_MAX) continue;
+
+            vertex_t cand_local = cand;
+            int pe_c;
+            locating_vertex(pe_c, cand_local, private_device_part_vertex_offset, n_pes);
+            weight_t acj, qout_n;
+            if (pe_c == my_pe) {
+                acj    = shared_device_community_weight[cand_local];
+                qout_n = shared_device_community_q_out[cand_local];
+            } else {
+                acj    = nvshmem_double_g(shared_device_community_weight + cand_local, pe_c);
+                qout_n = nvshmem_double_g(shared_device_community_q_out + cand_local, pe_c);
+            }
+
+            weight_t g;
+            if (directed) {
+                g = move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total,
+                                              eici, hash_val[s], tau, in_m, hash_in_val[s]);
+            } else {
+                g = move_gain<ACTIVE_OBJECTIVE>(hash_val[s], eici, ki, aci, acj,
+                                                qout_m, qout_n, q_total, mass);
+            }
+            if (g > best_gain ||
+                (g == best_gain && ((up_down && cand < best_dst) || (!up_down && cand > best_dst)))) {
+                best_gain = g;
+                best_dst  = cand;
+            }
+        }
+
+        // Reduce the per-lane bests across the warp, same tie-break.
+        for (int off = 16; off > 0; off >>= 1) {
+            const weight_t g_o = warp.shfl_down(best_gain, off);
+            const vertex_t d_o = warp.shfl_down(best_dst,  off);
+            if (g_o > best_gain ||
+                (g_o == best_gain && ((up_down && d_o < best_dst) || (!up_down && d_o > best_dst)))) {
+                best_gain = g_o;
+                best_dst  = d_o;
+            }
+        }
+
+        if (warp.thread_rank() == 0) {
+            vertex_t final_dst;
+            if (directed) {
+                final_dst = best_dst;                       // no ID gate (see 5cb048d)
+            } else if (up_down) {
+                final_dst = best_dst < src_community_id ? best_dst : src_community_id;
+            } else {
+                final_dst = best_dst > src_community_id ? best_dst : src_community_id;
+            }
+            shared_device_community_ids_new_[v] = final_dst;
+        }
+        warp.sync();
+    }
+}
+
+// Host launcher for the warp-per-vertex path. Single kernel, single stream.
+void calculate_eicj_and_move_vertex_warp(
+    vertex_t local_vertices,
+    vertex_t begin_vertex_id,
+    vertex_t* private_device_offset,
+    edge_t* private_device_edge,
+    weight_t* private_device_edge_weight,
+    weight_t* private_device_vertex_weight,
+    vertex_t* private_device_part_vertex_offset,
+    vertex_t* shared_device_community_ids_new,
+    vertex_t* shared_device_community_ids,
+    weight_t* shared_device_community_weight,
+    weight_t* shared_device_community_q_out,
+    weight_t* Q_sum,
+    vertex_t* hash_key,
+    weight_t* hash_val,
+    weight_t* hash_in_val,
+    weight_t mass,
+    int my_pe,
+    int n_pes,
+    bool up_down,
+    cudaStream_t stream,
+    weight_t* s_out_local,
+    double tau,
+    vertex_t* in_offset,
+    edge_t* in_edge,
+    weight_t* in_edge_weight)
+{
+    const int block_num = 256;                       // 8 warps per block
+    int grid_num = (int) iDivUp(local_vertices, (vertex_t)(block_num / 32));
+    if (grid_num < 1) grid_num = 1;
+    if (grid_num > 65535) grid_num = 65535;          // grid-stride loop covers the rest
+
+    move_vertices_warp<<<grid_num, block_num, 0, stream>>>(
+        begin_vertex_id, local_vertices,
+        private_device_offset, private_device_edge, private_device_edge_weight,
+        private_device_vertex_weight, private_device_part_vertex_offset,
+        shared_device_community_ids_new, shared_device_community_ids,
+        shared_device_community_weight, shared_device_community_q_out, Q_sum,
+        hash_key, hash_val, hash_in_val,
+        mass, my_pe, n_pes, up_down,
+        s_out_local, tau, in_offset, in_edge, in_edge_weight);
+    CUDA_RT_CALL(cudaGetLastError());                // the binned path never checked this
+    CUDA_RT_CALL(cudaStreamSynchronize(stream));
+}
+
 void calculate_eicj_and_move_vertex_bin(
     vertex_t local_vertices,
     vertex_t begin_vertex_id,
@@ -2224,9 +2491,11 @@ static void launch_compute_codelength(
 }  // namespace louvain
 
 void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double threshold, const int max_iter,
-                           const int max_phases, const double tau, const std::string &out_path) {
+                           const int max_phases, const double tau, const std::string &out_path,
+                           const std::string &move_mode) {
     int n_pes = nvshmem_n_pes();
     int my_pe = nvshmem_my_pe();
+    const bool use_warp_move = (move_mode != "binned");
 
     // stream create
     cudaStream_t default_stream;
@@ -2276,6 +2545,25 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 
     // init bins
     BIN* bins = new BIN(BIN_NUM, local_vertices);
+
+    // Global per-vertex hash scratch for the warp-per-vertex move kernel: vertex v owns the
+    // slice [2*offset[v], 2*offset[v+1]), i.e. capacity 2*deg(v). Sized from the ORIGINAL
+    // edge count, which upper-bounds every coarse level (coarsening only merges edges).
+    vertex_t *mv_hash_key    = nullptr;
+    weight_t *mv_hash_val    = nullptr;
+    weight_t *mv_hash_in_val = nullptr;
+    if (use_warp_move) {
+        const size_t hash_slots = (size_t) local_edges * 2;
+        CUDA_RT_CALL(cudaMalloc((void **) &mv_hash_key,    sizeof(vertex_t) * hash_slots));
+        CUDA_RT_CALL(cudaMalloc((void **) &mv_hash_val,    sizeof(weight_t) * hash_slots));
+        CUDA_RT_CALL(cudaMalloc((void **) &mv_hash_in_val, sizeof(weight_t) * hash_slots));
+        if (my_pe == 0) {
+            printf("local-moving kernel: warp-per-vertex (hash scratch %.1f MB)\n",
+                   (double)(hash_slots * (sizeof(vertex_t) + 2 * sizeof(weight_t))) / (1024.0 * 1024.0));
+        }
+    } else if (my_pe == 0) {
+        printf("local-moving kernel: degree-binned tile/block (legacy)\n");
+    }
 
     // directed-mode PageRank scratch
     const bool directed = gpuGraph->is_directed_();
@@ -2529,6 +2817,33 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
             start_in_loop = MPI_Wtime();
 
             // a) update community id
+            if (use_warp_move) {
+                calculate_eicj_and_move_vertex_warp(local_vertices,
+                                                    begin_vertex_id,
+                                                    private_device_offset,
+                                                    private_device_edge,
+                                                    private_device_edge_weight,
+                                                    private_device_vertex_weight,
+                                                    private_device_part_vertex_offset,
+                                                    shared_device_community_ids_new,
+                                                    shared_device_community_ids,
+                                                    shared_device_community_weight,
+                                                    shared_device_community_q_out,
+                                                    Q_sum,
+                                                    mv_hash_key,
+                                                    mv_hash_val,
+                                                    mv_hash_in_val,
+                                                    mass,
+                                                    my_pe,
+                                                    n_pes,
+                                                    up_down,
+                                                    default_stream,
+                                                    phase_directed ? pr_s_out : nullptr,
+                                                    phase_directed ? tau : 0.0,
+                                                    phase_directed ? pr_in_offset : nullptr,
+                                                    phase_directed ? pr_in_edge : nullptr,
+                                                    phase_directed ? pr_in_edge_weight : nullptr);
+            } else {
             calculate_eicj_and_move_vertex_bin(local_vertices,
                                                 begin_vertex_id,
                                                 private_device_offset,
@@ -2554,6 +2869,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                phase_directed ? pr_in_offset : nullptr,
                                                phase_directed ? pr_in_edge : nullptr,
                                                phase_directed ? pr_in_edge_weight : nullptr);
+            }
 
 
 
@@ -2767,6 +3083,9 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     CUDA_RT_CALL(cudaFree(cq_backup));
     CUDA_RT_CALL(cudaFree(qsum_backup));
     if (s_node_level0 != nullptr) CUDA_RT_CALL(cudaFree(s_node_level0));
+    if (mv_hash_key    != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_key));
+    if (mv_hash_val    != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_val));
+    if (mv_hash_in_val != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_in_val));
     nvshmem_free(Q);
     nvshmem_free(Q_sum);
     nvshmem_free(cl_reduce);

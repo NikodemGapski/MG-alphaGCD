@@ -14,8 +14,10 @@ namespace louvain {
     // out_path: if non-empty, write the flat original-vertex -> community map (one
     // "<vertex> <community>" line per vertex) so the partition can be scored
     // independently of the GPU's own codelength (tools/score_partition.py).
+    // move_mode: "warp"   = one warp per vertex, global per-vertex hash (default; clean path)
+    //            "binned" = the original degree-binned tile/block kernels (kept for A/B)
     void run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double threshold, const int max_iter, const int max_phases, const double tau = 0.0,
-             const std::string &out_path = std::string());
+             const std::string &out_path = std::string(), const std::string &move_mode = std::string("warp"));
 };
 
 

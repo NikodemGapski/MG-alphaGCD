@@ -31,6 +31,9 @@ int main(int argc, char* argv[]){
     // -out writes the final flat vertex->community map, so the partition can be scored
     // independently of the GPU's self-reported codelength (tools/score_partition.py).
     const std::string out_path = get_argval<std::string>(argv, argv + argc, "-out", "");
+    // -move selects the local-moving kernel: "warp" (default, one warp per vertex) or
+    // "binned" (the original degree-binned tile/block kernels).
+    const std::string move_mode = get_argval<std::string>(argv, argv + argc, "-move", "warp");
 
     //----------------------------------------------------------------/
     //------------------------- init nvshmem -------------------------/
@@ -140,7 +143,7 @@ int main(int argc, char* argv[]){
             louvain_gl::run(hostGraph, gpuGraph, threshold, max_iter, max_phases);
             break;
         case 2:
-            louvain::run(hostGraph, gpuGraph, threshold, max_iter, max_phases, tau, out_path);
+            louvain::run(hostGraph, gpuGraph, threshold, max_iter, max_phases, tau, out_path, move_mode);
             break;
         default:
             printf("the version is unsupported\n");
