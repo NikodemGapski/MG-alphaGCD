@@ -5,6 +5,7 @@
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cmath>
 #include <fstream>
 #include <numeric>
 #include <vector>
@@ -472,7 +473,13 @@ compute_codelength(
     int my_pe,
     int n_pes,
     weight_t* Q,
-    weight_t* Q_sum
+    weight_t* Q_sum,
+    // Sum_v F(p_vis_v) of the ORIGINAL (level-0) vertices. nullptr = derive it from this
+    // level's vertex weights. The node-entropy term is a constant within a phase, but it is
+    // re-based by coarsening (super-nodes have larger p than the nodes they contain), so
+    // deriving it per level makes L incomparable across phases -- see the phase-continuity
+    // check in louvain::run. Passing the level-0 value keeps L the TRUE codelength.
+    weight_t* s_node_level0
 )
 {
     cg::grid_group grid = cg::this_grid();
@@ -498,8 +505,10 @@ compute_codelength(
         s_mod  += plogp((cut + vol) / mass);
     }
     // per-node contributions (partition independent within a phase)
-    for (vertex_t v = grid.thread_rank(); v < local_vertices; v += grid.num_threads()) {
-        s_node += plogp(private_device_vertex_weight[v] / mass);
+    if (s_node_level0 == nullptr) {
+        for (vertex_t v = grid.thread_rank(); v < local_vertices; v += grid.num_threads()) {
+            s_node += plogp(private_device_vertex_weight[v] / mass);
+        }
     }
 
     s_qsum = cg::reduce(tile32, s_qsum, cg::plus<weight_t>());
@@ -521,9 +530,12 @@ compute_codelength(
     grid.sync();
 
     if (grid.thread_rank() == 0) {
-        weight_t q_raw = cl_reduce[0];
-        weight_t Qp    = q_raw / mass;
-        weight_t L     = plogp(Qp) - 2.0 * cl_reduce[1] - cl_reduce[3] + cl_reduce[2];
+        weight_t q_raw  = cl_reduce[0];
+        weight_t Qp     = q_raw / mass;
+        weight_t s_node_total = (s_node_level0 != nullptr) ? s_node_level0[0] : cl_reduce[3];
+        weight_t L      = plogp(Qp) - 2.0 * cl_reduce[1] - s_node_total + cl_reduce[2];
+        // Publish the node-entropy term so Phase 0 can capture it as the level-0 constant.
+        cl_reduce[3]    = s_node_total;
         // The map-equation codelength is an entropy and must be >= 0. A negative value
         // signals an invalid objective (e.g. a mis-derived directed q_out); surface it
         // loudly instead of letting the driver chase a meaningless minimum.
@@ -2139,7 +2151,9 @@ static void launch_compute_codelength(
     cudaStream_t default_stream,
     // directed-mode extras (nullptr = undirected)
     weight_t* s_out = nullptr,
-    double tau = 0.0)
+    double tau = 0.0,
+    // level-0 Sum_v F(p_vis_v); nullptr = derive from this level's vertex weights
+    weight_t* s_node_level0 = nullptr)
 {
     int grid_size = 0;
 
@@ -2198,7 +2212,8 @@ static void launch_compute_codelength(
             (void *) &mass, (void *) &local_vertices,
             (void *) &shared_device_community_weight, (void *) &shared_device_community_q_out,
             (void *) &private_device_vertex_weight, (void *) &cl_reduce,
-            (void *) &my_pe, (void *) &n_pes, (void *) &Q, (void *) &Q_sum
+            (void *) &my_pe, (void *) &n_pes, (void *) &Q, (void *) &Q_sum,
+            (void *) &s_node_level0
     };
     NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_codelength, block_dims, a3, d_shared_mem, &grid_size));
     nvshmem_barrier_all();
@@ -2231,6 +2246,11 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     auto *part_vertex_offset = gpuGraph->get_part_vertex_offset_();
     weight_t Q_host = 0;
     weight_t Q_old_host = -1;
+
+    // Sum_v F(p_vis_v) over the ORIGINAL vertices, captured at Phase 0 and reused by every
+    // later phase so that L stays the codelength of the partition (see compute_codelength).
+    weight_t *s_node_level0 = nullptr;
+    double prev_phase_final_L = 0.0;
 
     // Flat map from an ORIGINAL vertex to its community at the current level. Each phase
     // composes this with the level's assignment, so after the last phase it is the full
@@ -2435,9 +2455,35 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                   shared_device_community_weight, shared_device_community_q_out,
                                   shared_device_community_delta_weight, private_device_vertex_weight,
                                   cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream,
-                                  phase_directed ? pr_s_out : nullptr, phase_directed ? tau : 0.0);
+                                  phase_directed ? pr_s_out : nullptr, phase_directed ? tau : 0.0,
+                                  s_node_level0);
 
         CUDA_RT_CALL(cudaMemcpy(&new_Q, Q, sizeof(weight_t) , cudaMemcpyDeviceToHost));
+
+        // Capture Sum_v F(p_vis_v) of the ORIGINAL vertices once, and reuse it for every
+        // later phase. Coarsening merges nodes into super-nodes with larger visit rates, so
+        // re-deriving this term per level silently changes the objective: L stops being the
+        // codelength of the partition and the outer phase loop compares incomparable numbers.
+        // (Skipped for directed runs: Phase 1+ currently falls back to the undirected
+        // objective on the symmetrized coarse graph, a different objective in different
+        // units, so no single constant is valid. Directed coarsening -- B6 -- fixes that.)
+        if (phase_num == 0 && !directed && s_node_level0 == nullptr) {
+            CUDA_RT_CALL(cudaMalloc((void **) &s_node_level0, sizeof(weight_t)));
+            CUDA_RT_CALL(cudaMemcpy(s_node_level0, cl_reduce + 3, sizeof(weight_t),
+                                    cudaMemcpyDeviceToDevice));
+        }
+
+        // Phase continuity: a singleton partition of the coarse graph IS the partition the
+        // previous phase ended on, so its codelength must be identical. If this trips, the
+        // objective is being re-based across levels and the multi-level L is meaningless.
+        if (my_pe == 0 && phase_num > 0 && !directed) {
+            const double L_now = -(double)new_Q;
+            if (fabs(L_now - prev_phase_final_L) > 1.0e-6) {
+                printf("[WARN] codelength not conserved across coarsening: phase %d ended at "
+                       "L=%.6f but phase %d starts at L=%.6f (delta %+.6f)\n",
+                       phase_num - 1, prev_phase_final_L, phase_num, L_now, L_now - prev_phase_final_L);
+            }
+        }
 
         cur_Q = new_Q - 1;
         phase_initial_score = new_Q;
@@ -2556,7 +2602,8 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                       shared_device_community_weight, shared_device_community_q_out,
                                       shared_device_community_delta_weight, private_device_vertex_weight,
                                       cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream,
-                                      phase_directed ? pr_s_out : nullptr, phase_directed ? tau : 0.0);
+                                      phase_directed ? pr_s_out : nullptr, phase_directed ? tau : 0.0,
+                                      s_node_level0);
 
             stop_in_loop = MPI_Wtime();
             compute_modularity_time += (stop_in_loop - start_in_loop);
@@ -2627,6 +2674,8 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
             printf("The average execution time per loop: %f s, %f ms\n", loop_time / 1000, loop_time);
         }
 
+        prev_phase_final_L = -(double)new_Q;
+
         // Compose this level's assignment into the flat original-vertex -> community map.
         // community_ids holds ids in this level's vertex space and is not dense; coarsening
         // compacts it (renew_community_id_cuda: dense = scan(used)[old] - 1). Reproduce that
@@ -2643,10 +2692,10 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                 orig_to_comm[v] = dense[level_comm[orig_to_comm[v]]];
         }
 
-        // The map-equation codelength is not invariant across coarsening (the
-        // per-node entropy term changes level to level), so phase continuation is
-        // driven by this phase's own improvement (final vs. initial score) rather
-        // than by comparing scores across levels. For modularity these are equal.
+        // Phase continuation is driven by this phase's own improvement (final vs. initial
+        // score). With the level-0 node-entropy term pinned (s_node_level0) the codelength is
+        // now conserved across coarsening, so comparing across levels would work too for the
+        // undirected path -- but not yet for directed, whose Phase 1+ changes objective.
         Q_old_host = phase_initial_score;
         Q_host = new_Q;
         if ((Q_host - Q_old_host) <= threshold) break;
@@ -2717,6 +2766,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     CUDA_RT_CALL(cudaFree(cw_backup));
     CUDA_RT_CALL(cudaFree(cq_backup));
     CUDA_RT_CALL(cudaFree(qsum_backup));
+    if (s_node_level0 != nullptr) CUDA_RT_CALL(cudaFree(s_node_level0));
     nvshmem_free(Q);
     nvshmem_free(Q_sum);
     nvshmem_free(cl_reduce);
