@@ -5,6 +5,9 @@
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <fstream>
+#include <numeric>
+#include <vector>
 
 namespace cg = cooperative_groups;
 
@@ -2206,7 +2209,7 @@ static void launch_compute_codelength(
 }  // namespace louvain
 
 void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double threshold, const int max_iter,
-                           const int max_phases, const double tau) {
+                           const int max_phases, const double tau, const std::string &out_path) {
     int n_pes = nvshmem_n_pes();
     int my_pe = nvshmem_my_pe();
 
@@ -2228,6 +2231,21 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     auto *part_vertex_offset = gpuGraph->get_part_vertex_offset_();
     weight_t Q_host = 0;
     weight_t Q_old_host = -1;
+
+    // Flat map from an ORIGINAL vertex to its community at the current level. Each phase
+    // composes this with the level's assignment, so after the last phase it is the full
+    // hierarchical partition. Only meaningful at -np 1 (community_ids is distributed).
+    const vertex_t original_vertices = total_vertices;
+    std::vector<vertex_t> orig_to_comm;
+    if (!out_path.empty()) {
+        if (n_pes != 1) {
+            if (my_pe == 0)
+                printf("[WARN] -out is only supported at -np 1 (community_ids is distributed); skipping.\n");
+        } else {
+            orig_to_comm.resize(original_vertices);
+            std::iota(orig_to_comm.begin(), orig_to_comm.end(), 0);
+        }
+    }
 
     // private memory
     auto *private_device_offset = gpuGraph->get_private_device_offset_();
@@ -2609,6 +2627,22 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
             printf("The average execution time per loop: %f s, %f ms\n", loop_time / 1000, loop_time);
         }
 
+        // Compose this level's assignment into the flat original-vertex -> community map.
+        // community_ids holds ids in this level's vertex space and is not dense; coarsening
+        // compacts it (renew_community_id_cuda: dense = scan(used)[old] - 1). Reproduce that
+        // same compaction here so orig_to_comm stays in the NEXT level's vertex space.
+        if (!orig_to_comm.empty()) {
+            std::vector<vertex_t> level_comm(local_vertices);
+            CUDA_RT_CALL(cudaMemcpy(level_comm.data(), shared_device_community_ids,
+                                    sizeof(vertex_t) * local_vertices, cudaMemcpyDeviceToHost));
+            std::vector<vertex_t> dense(local_vertices, 0);
+            for (vertex_t v = 0; v < local_vertices; ++v) dense[level_comm[v]] = 1;
+            vertex_t run_sum = 0;
+            for (vertex_t c = 0; c < local_vertices; ++c) { run_sum += dense[c]; dense[c] = run_sum - 1; }
+            for (vertex_t v = 0; v < original_vertices; ++v)
+                orig_to_comm[v] = dense[level_comm[orig_to_comm[v]]];
+        }
+
         // The map-equation codelength is not invariant across coarsening (the
         // per-node entropy term changes level to level), so phase continuation is
         // driven by this phase's own improvement (final vs. initial score) rather
@@ -2660,6 +2694,26 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 //        printf("Total phases: %d\n", phase_num++);
 //        printf("Total loops: %d\n", loop_total);
     }
+    if (!orig_to_comm.empty() && my_pe == 0) {
+        std::ofstream out(out_path);
+        if (!out) {
+            printf("[WARN] could not open -out file '%s'\n", out_path.c_str());
+        } else {
+            for (vertex_t v = 0; v < original_vertices; ++v)
+                out << v << ' ' << orig_to_comm[v] << '\n';
+            out.close();
+            vertex_t n_comm = 0;
+            {
+                std::vector<char> seen(original_vertices, 0);
+                for (vertex_t v = 0; v < original_vertices; ++v) {
+                    if (!seen[orig_to_comm[v]]) { seen[orig_to_comm[v]] = 1; ++n_comm; }
+                }
+            }
+            printf("Wrote partition to %s  (%u vertices, %u communities)\n",
+                   out_path.c_str(), original_vertices, n_comm);
+        }
+    }
+
     CUDA_RT_CALL(cudaFree(cw_backup));
     CUDA_RT_CALL(cudaFree(cq_backup));
     CUDA_RT_CALL(cudaFree(qsum_backup));

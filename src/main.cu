@@ -28,6 +28,9 @@ int main(int argc, char* argv[]){
     // -tau sets the PageRank teleportation probability (Infomap default: 0.15).
     const bool directed = get_arg(argv, argv + argc, "-directed");
     const double tau = get_argval<double>(argv, argv + argc, "-tau", 0.15);
+    // -out writes the final flat vertex->community map, so the partition can be scored
+    // independently of the GPU's self-reported codelength (tools/score_partition.py).
+    const std::string out_path = get_argval<std::string>(argv, argv + argc, "-out", "");
 
     //----------------------------------------------------------------/
     //------------------------- init nvshmem -------------------------/
@@ -137,7 +140,7 @@ int main(int argc, char* argv[]){
             louvain_gl::run(hostGraph, gpuGraph, threshold, max_iter, max_phases);
             break;
         case 2:
-            louvain::run(hostGraph, gpuGraph, threshold, max_iter, max_phases, tau);
+            louvain::run(hostGraph, gpuGraph, threshold, max_iter, max_phases, tau, out_path);
             break;
         default:
             printf("the version is unsupported\n");
