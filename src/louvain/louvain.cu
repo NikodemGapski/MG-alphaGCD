@@ -1751,9 +1751,10 @@ move_vertices_warp(
     weight_t* shared_device_community_weight,
     weight_t* shared_device_community_q_out,
     weight_t* Q_sum,
-    vertex_t* hash_key,        // global scratch, 2 * local_edges entries
+    vertex_t* hash_key,        // global scratch; v owns [hash_off[v], hash_off[v+1])
     weight_t* hash_val,
     weight_t* hash_in_val,
+    edge_t*   hash_off,        // 2*(out_deg + in_deg) per vertex -> never more than half full
     weight_t mass,
     int my_pe,
     int n_pes,
@@ -1785,17 +1786,24 @@ move_vertices_warp(
     for (vertex_t v = warp_id_grid; v < local_vertices; v += warps_in_grid) {
         const edge_t edge_lb = private_device_offset[v];
         const edge_t edge_rb = private_device_offset[v + 1];
+        const edge_t in_lb   = directed ? in_offset[v]     : (edge_t)0;
+        const edge_t in_rb   = directed ? in_offset[v + 1] : (edge_t)0;
         const vertex_t src_community_id = shared_device_community_ids[v];
 
-        // Isolated vertex: no neighbours, so no candidate community. It must stay put.
-        if (edge_lb == edge_rb) {
+        // Truly isolated (no out- AND no in-edges): no candidate community, must stay put.
+        // NOTE a DANGLING vertex (out-degree 0 but with in-edges) is NOT isolated. It used to be
+        // treated as such, because candidates were gathered from the out-CSR only -- so all 2187
+        // dangling vertices of wiki-Vote were frozen as singletons forever. Their flow all
+        // teleports away, which is expensive, so they very much want to join a module; the gain
+        // already handles it through the in_n term. Candidates now come from BOTH CSRs.
+        if (edge_lb == edge_rb && in_lb == in_rb) {
             if (warp.thread_rank() == 0) shared_device_community_ids_new_[v] = src_community_id;
             continue;
         }
 
-        const edge_t hash_lb = edge_lb * 2;
-        const edge_t hash_rb = edge_rb * 2;
-        const vertex_t hash_size = (vertex_t)(hash_rb - hash_lb);   // = 2*deg(v)
+        const edge_t hash_lb = hash_off[v];
+        const edge_t hash_rb = hash_off[v + 1];
+        const vertex_t hash_size = (vertex_t)(hash_rb - hash_lb);   // = 2*(out_deg + in_deg)
 
         for (edge_t s = hash_lb + warp.thread_rank(); s < hash_rb; s += 32) {
             hash_key[s]    = UINT32_MAX;
@@ -1847,12 +1855,14 @@ move_vertices_warp(
         tot_out = cg::reduce(warp, tot_out, cg::plus<weight_t>());
         warp.sync();
 
-        // Directed: walk in-flow into v from each module. Look up (never insert) so the
-        // table cannot overflow. Remote in-neighbours have no symmetric p[u]; skip them
-        // (exact at -np 1). Own-module in-flow is reduced into in_m.
+        // Directed: walk in-flow into v from each module. The in-neighbour's module is INSERTED
+        // as a candidate (not just looked up): a module that only points AT v is still somewhere
+        // v can profitably move to -- that is the whole reason a dangling vertex can move at all.
+        // The table is sized 2*(out_deg+in_deg), so it stays at most half full and probing always
+        // terminates. Remote in-neighbours have no symmetric p[u]; skip them (exact at -np 1).
         weight_t in_m = 0.;
         if (directed) {
-            for (edge_t e = in_offset[v] + warp.thread_rank(); e < in_offset[v + 1]; e += 32) {
+            for (edge_t e = in_lb + warp.thread_rank(); e < in_rb; e += 32) {
                 vertex_t u = in_edge[e];
                 if (u == v + begin_vertex_id) continue;   // self-loop: moves with v, never exits
                 int pe_u;
@@ -1867,8 +1877,9 @@ move_vertices_warp(
                     in_m += contrib;
                 } else {
                     vertex_t h = (vertex_t)(((unsigned long long)cu * 107ULL) % hash_size);
-                    while (hash_key[hash_lb + h] != UINT32_MAX) {
-                        if (hash_key[hash_lb + h] == cu) {
+                    while (true) {
+                        const vertex_t old = atomicCAS(hash_key + hash_lb + h, UINT32_MAX, cu);
+                        if (old == UINT32_MAX || old == cu) {
                             atomicAdd(hash_in_val + hash_lb + h, contrib);
                             break;
                         }
@@ -1991,6 +2002,7 @@ void calculate_eicj_and_move_vertex_warp(
     vertex_t* hash_key,
     weight_t* hash_val,
     weight_t* hash_in_val,
+    edge_t*   hash_off,
     weight_t mass,
     int my_pe,
     int n_pes,
@@ -2018,7 +2030,7 @@ void calculate_eicj_and_move_vertex_warp(
         private_device_vertex_weight, private_device_part_vertex_offset,
         shared_device_community_ids_new, shared_device_community_ids,
         shared_device_community_weight, shared_device_community_q_out, Q_sum,
-        hash_key, hash_val, hash_in_val,
+        hash_key, hash_val, hash_in_val, hash_off,
         mass, my_pe, n_pes, up_down,
         s_out_local, tau, in_offset, in_edge, in_edge_weight,
         node_count, community_node_count, dangling_flow, community_dangling_flow, N_total);
@@ -2668,6 +2680,31 @@ __global__ void fill_weight(weight_t* a, vertex_t n, weight_t val)
     for (vertex_t i = grid.thread_rank(); i < n; i += grid.num_threads()) a[i] = val;
 }
 
+// Per-vertex hash slice offsets: v owns 2*(out_deg(v) + in_deg(v)) slots. Sizing by BOTH
+// degrees is what lets an in-neighbour's module be inserted as a candidate (see
+// move_vertices_warp); at 2x the neighbour count the table is never more than half full, so
+// linear probing always terminates. in_offset == nullptr (undirected) gives the old 2*out_deg.
+static void build_hash_offsets(
+    vertex_t local_vertices,
+    vertex_t* d_offset, vertex_t* d_in_offset,
+    edge_t* d_hash_off, cudaStream_t stream)
+{
+    std::vector<vertex_t> off(local_vertices + 1), in_off;
+    CUDA_RT_CALL(cudaMemcpy(off.data(), d_offset, sizeof(vertex_t) * (local_vertices + 1), cudaMemcpyDeviceToHost));
+    if (d_in_offset != nullptr) {
+        in_off.resize(local_vertices + 1);
+        CUDA_RT_CALL(cudaMemcpy(in_off.data(), d_in_offset, sizeof(vertex_t) * (local_vertices + 1), cudaMemcpyDeviceToHost));
+    }
+    std::vector<edge_t> h(local_vertices + 1, 0);
+    for (vertex_t v = 0; v < local_vertices; ++v) {
+        const edge_t od = off[v + 1] - off[v];
+        const edge_t id = in_off.empty() ? (edge_t)0 : (in_off[v + 1] - in_off[v]);
+        h[v + 1] = h[v] + 2 * (od + id);
+    }
+    CUDA_RT_CALL(cudaMemcpy(d_hash_off, h.data(), sizeof(edge_t) * (local_vertices + 1), cudaMemcpyHostToDevice));
+    CUDA_RT_CALL(cudaStreamSynchronize(stream));
+}
+
 // Rebuild the coarse in-CSR by transposing the coarse out-CSR. Done on the host: the coarse
 // graph is small (it only shrinks) and this runs once per phase, so it is not worth a device
 // sort. -np 1 only, which is also the only regime where the directed in-flow gain is exact.
@@ -2778,11 +2815,17 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     vertex_t *mv_hash_key    = nullptr;
     weight_t *mv_hash_val    = nullptr;
     weight_t *mv_hash_in_val = nullptr;
+    edge_t   *mv_hash_off    = nullptr;
     if (use_warp_move) {
-        const size_t hash_slots = (size_t) local_edges * 2;
+        // 2*(out_deg + in_deg) slots per vertex. The in-degree share is what makes an
+        // in-neighbour's module an insertable candidate, which is the only way a DANGLING
+        // vertex (no out-edges) can ever move. Coarsening only shrinks both edge counts.
+        const size_t in_edges = gpuGraph->is_directed_() ? (size_t) local_edges : (size_t) 0;
+        const size_t hash_slots = ((size_t) local_edges + in_edges) * 2;
         CUDA_RT_CALL(cudaMalloc((void **) &mv_hash_key,    sizeof(vertex_t) * hash_slots));
         CUDA_RT_CALL(cudaMalloc((void **) &mv_hash_val,    sizeof(weight_t) * hash_slots));
         CUDA_RT_CALL(cudaMalloc((void **) &mv_hash_in_val, sizeof(weight_t) * hash_slots));
+        CUDA_RT_CALL(cudaMalloc((void **) &mv_hash_off,    sizeof(edge_t) * (total_vertices + 1)));
         if (my_pe == 0) {
             printf("local-moving kernel: warp-per-vertex (hash scratch %.1f MB)\n",
                    (double)(hash_slots * (sizeof(vertex_t) + 2 * sizeof(weight_t))) / (1024.0 * 1024.0));
@@ -3102,6 +3145,14 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 
         bins->bin_create(private_device_offset, local_vertices);
 
+        // Hash slices for this level. Directed vertices also get room for their in-neighbours'
+        // modules, so those become insertable candidates.
+        if (use_warp_move) {
+            build_hash_offsets(local_vertices, private_device_offset,
+                               phase_directed ? pr_in_offset : nullptr,
+                               mv_hash_off, default_stream);
+        }
+
 
         // 4. Update the community id of each vertex (main loop)
         // The presence of negative modularity leads to a direct termination of the cycle.
@@ -3132,6 +3183,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                     mv_hash_key,
                                                     mv_hash_val,
                                                     mv_hash_in_val,
+                                                    mv_hash_off,
                                                     mass,
                                                     my_pe,
                                                     n_pes,
@@ -3529,6 +3581,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     if (mv_hash_key    != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_key));
     if (mv_hash_val    != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_val));
     if (mv_hash_in_val != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_in_val));
+    if (mv_hash_off    != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_off));
     nvshmem_free(Q);
     nvshmem_free(Q_sum);
     nvshmem_free(cl_reduce);
