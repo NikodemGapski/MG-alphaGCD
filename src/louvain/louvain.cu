@@ -184,9 +184,15 @@ __device__ __forceinline__ weight_t move_gain<Objective::MapEquation>(
     return -dL;  // maximise the codelength decrease
 }
 
-// Directed map equation move gain using the proportional-teleportation objective:
-//   q_out[i] = τ·q_vis[i]·(1-q_vis[i]) + (1-τ)·q_walk_out[i]
-// consistent with apply_teleportation_q_out.
+// Directed map equation move gain under Infomap's UNRECORDED teleportation:
+//   q_out[i] = τ·(N - n_i)/N·q_vis[i] + (1-τ)·q_walk_out[i]
+// consistent with apply_teleportation_q_out. n_i is the number of ORIGINAL nodes in module i
+// and N the total: a walker in i teleports to a uniformly random node, which lands outside i
+// with probability (N - n_i)/N.
+//
+// The previous model was *proportional* teleportation, τ·q_vis·(1-q_vis). That is not what
+// infomap optimises, and it is minimised by lumping the graph into a couple of giant modules
+// (on wiki-Vote its best partition is two ~2200-node blobs holding 29% of the flow).
 //
 // e_to_m_norm = Σ_{v→w∈m} w(v,w)/s_out[v]  (normalised transition prob v→own module)
 // e_to_n_norm = Σ_{v→w∈n} w(v,w)/s_out[v]  (normalised transition prob v→candidate)
@@ -214,7 +220,35 @@ __device__ __forceinline__ weight_t move_gain_directed_approx(
     weight_t e_to_n_norm, // normalised transition prob from v to n
     double tau,
     weight_t in_m_flow = 0.,   // walk in-flow into v from m  (0 = old approximation)
-    weight_t in_n_flow = 0.    // walk in-flow into v from n
+    weight_t in_n_flow = 0.,   // walk in-flow into v from n
+    // Total normalised out-flow of v, EXCLUDING self-loops:  sum_{w != v} w(v,w)/s_out[v].
+    // The old code hard-coded this to 1, which is only true at level 0 for a vertex that has
+    // out-edges. It is WRONG for:
+    //   * dangling vertices (s_out == 0): true walk-out flow is 0, but 1-em charges a full p.
+    //     wiki-Vote has 2187 of them.
+    //   * every coarse super-node under B6: s_out(C) := p_C while sum_D f(C,D) = p_C minus the
+    //     dangling mass inside C, so the total out-fraction is < 1.
+    //   * self-loops f(C,C) (which every coarse graph has): that flow stays with C wherever C
+    //     goes, so it must not count as leaving either module.
+    // With dangling nodes and self-loops present the 1-em form is off by up to 0.43 bits and
+    // disagrees with the exact dL on the SIGN of the move 8% of the time
+    // (tools/directed_gain_dangling_check.py); passing the real value is exact to ~2e-15.
+    weight_t tot_out = 1.,
+    // Unrecorded teleportation needs the module NODE COUNTS (in original nodes, so they must
+    // be carried through coarsening like the flow) and the total N.
+    weight_t n_m = 0.,     // n_i of the old module m, INCLUDING v
+    weight_t n_n = 0.,     // n_i of the candidate module n, excluding v
+    weight_t nc_v = 0.,    // how many original nodes v itself represents (1 at level 0)
+    weight_t N_total = 1.,
+    // DANGLING flow. A node with no out-links has nothing to follow, so it teleports with
+    // probability ONE, not tau -- its exit flow is (N-n_i)/N * p, coefficient 1. Charging it
+    // only tau makes a module packed with dangling nodes almost free to sit in, which is why a
+    // partition of two ~2200-node blobs beat infomap's on wiki-Vote (26% of it is dangling).
+    // Omitting these terms puts the WRONG SIGN on 23% of moves
+    // (tools/directed_gain_dangling_check.py); with them the gain is exact to ~2e-15.
+    weight_t d_m = 0.,     // dangling flow of module m, INCLUDING v's
+    weight_t d_n = 0.,     // dangling flow of module n, excluding v's
+    weight_t d_v = 0.      // dangling flow of v itself (== p_v at level 0 if v is dangling)
 ) {
     const double p  = (double)p_vis_v;
     const double qm = (double)q_vis_m;  // q_vis[m] including v
@@ -228,10 +262,23 @@ __device__ __forceinline__ weight_t move_gain_directed_approx(
     const double im  = (double)in_m_flow;
     const double in_ = (double)in_n_flow;
 
-    // Exact deltas for q_out[i]=τ·qv·(1-qv)+(1-τ)·qw when v moves from m to n.
-    // Δqw[m] = -p·(1-em) + in_m_flow,  Δqw[n] = +p·(1-en) - in_n_flow.
-    const double dqm = tv * p * (2.0*qm - 1.0 - p) - (1.0-tv) * (p * (1.0 - em) - im);
-    const double dqn = tv * p * (1.0 - 2.0*qn - p) + (1.0-tv) * (p * (1.0 - en) - in_);
+    // Exact deltas for q_out[i] = τ·(N-n_i)/N·q_vis[i] + (1-τ)·q_walk_out[i] when v moves m->n.
+    // The walk flow that leaves m is p·(tot_out - em), NOT p·(1 - em): see tot_out above.
+    // The teleport factor changes too, because n_m shrinks by nc_v and n_n grows by nc_v.
+    const double to = (double)tot_out;
+    const double N  = (double)N_total;
+    const double am  = (N - (double)n_m) / N;               // teleport factor of m, before
+    const double am2 = (N - (double)n_m + (double)nc_v) / N; // ... after v leaves
+    const double an  = (N - (double)n_n) / N;               // teleport factor of n, before
+    const double an2 = (N - (double)n_n - (double)nc_v) / N; // ... after v joins
+    const double dm = (double)d_m, dn = (double)d_n, dv = (double)d_v;
+    // q_out[i] = (N-n_i)/N * [ tau*q_vis[i] + (1-tau)*d_i ] + (1-tau)*q_walk_out[i]
+    const double dqm = am2 * (tv * (qm - p) + (1.0-tv) * (dm - dv))
+                     - am  * (tv *  qm      + (1.0-tv) *  dm)
+                     + (1.0-tv) * (im - p * (to - em));
+    const double dqn = an2 * (tv * (qn + p) + (1.0-tv) * (dn + dv))
+                     - an  * (tv *  qn      + (1.0-tv) *  dn)
+                     + (1.0-tv) * (p * (to - en) - in_);
 
     // q_vis after the move
     const double qvis_m_new = qm - p;
@@ -371,25 +418,35 @@ compute_community_q_walk_out_local_atomic(
     }
 }
 
-// Directed map equation: convert q_walk_out → q_out using proportional teleportation.
-//   q_out[i] = τ·q_vis[i]·(1 - q_vis[i]) + (1-τ)·q_walk_out[i]
-// P(exit i via teleport | visiting i) = τ·(1-q_vis[i]) (proportional model: teleport target
-// is drawn proportional to ergodic visit probability, so fraction landing outside i = 1-q_vis[i]).
-// This gives q_out→0 for the all-in-one community (q_vis=1, q_walk=0) and q_out≈p_v for
-// singletons (q_vis=p_v≪1), guaranteeing L≥0 from compute_codelength.
+// Directed map equation: convert q_walk_out → q_out using Infomap's UNRECORDED teleportation.
+//   q_out[i] = τ·(N - n_i)/N·q_vis[i] + (1-τ)·q_walk_out[i]
+// A walker in module i teleports (probability τ) to a uniformly random node, which lands
+// OUTSIDE i with probability (N - n_i)/N -- so n_i is a count of ORIGINAL nodes and must be
+// carried through coarsening, exactly like the flow (see aggregate_coarse_flow).
+//
+// This replaces the previous *proportional* model τ·q_vis·(1-q_vis), which is not what infomap
+// optimises and is minimised by lumping the graph into a couple of giant modules.
 __global__ void __launch_bounds__(1024, 1)
 apply_teleportation_q_out(
     vertex_t local_vertices,
     weight_t tau,
-    weight_t* shared_device_community_weight,   // q_vis[i]
-    weight_t* shared_device_community_q_out      // in: q_walk_out[i], out: q_out[i]
+    weight_t* shared_device_community_weight,      // q_vis[i]
+    weight_t* shared_device_community_q_out,       // in: q_walk_out[i], out: q_out[i]
+    weight_t* shared_device_community_node_count,     // n_i, in ORIGINAL nodes
+    weight_t* shared_device_community_dangling_flow,  // d_i: flow on DANGLING nodes of i
+    weight_t N_total
 )
 {
     for (vertex_t i = (blockIdx.x * blockDim.x) + threadIdx.x; i < local_vertices; i += blockDim.x * gridDim.x) {
         weight_t q_vis  = shared_device_community_weight[i];
         weight_t q_walk = shared_device_community_q_out[i];
+        weight_t n_i    = shared_device_community_node_count[i];
+        weight_t d_i    = shared_device_community_dangling_flow[i];
+        const double tele = ((double)N_total - (double)n_i) / (double)N_total;
+        // dangling nodes teleport with probability 1, everyone else with probability tau
         shared_device_community_q_out[i] = (weight_t)(
-            tau * (double)q_vis * (1.0 - (double)q_vis) + (1.0 - tau) * (double)q_walk);
+            tele * (tau * (double)q_vis + (1.0 - tau) * (double)d_i)
+            + (1.0 - tau) * (double)q_walk);
     }
 }
 
@@ -1705,7 +1762,13 @@ move_vertices_warp(
     double tau,
     vertex_t* in_offset,       // directed in-CSR (local-indexed; in_edge holds GLOBAL ids)
     edge_t* in_edge,
-    weight_t* in_edge_weight
+    weight_t* in_edge_weight,
+    // directed: unrecorded teleportation needs per-vertex and per-module ORIGINAL node counts
+    weight_t* node_count,                 // nc[v]: how many original nodes v represents
+    weight_t* community_node_count,       // n_i per module
+    weight_t* dangling_flow,              // d[v]: flow on dangling originals inside v
+    weight_t* community_dangling_flow,    // d_i per module
+    weight_t  N_total
 )
 {
     cg::grid_group grid = cg::this_grid();
@@ -1745,10 +1808,17 @@ move_vertices_warp(
         const weight_t sv = directed ? s_out_local[v] : (weight_t)1.0;
 
         // Gather the weight from v to each neighbouring community (hash), and to its own
-        // community (eici). Self-loops are excluded from eici, as in compute_codelength.
+        // community (eici). Self-loops are skipped entirely: that flow stays with v wherever v
+        // goes, so it never exits any module (level-0 graphs have none, but every COARSE graph
+        // does). tot_out is v's total normalised out-flow excluding self-loops -- the directed
+        // gain needs the real value, not the 1 it used to assume (see move_gain_directed_approx).
         weight_t eici = 0.;
+        weight_t tot_out = 0.;
         for (edge_t e = edge_lb + warp.thread_rank(); e < edge_rb; e += 32) {
-            vertex_t neighbor_id = private_device_edge[e];
+            const vertex_t nb_global = private_device_edge[e];
+            if (nb_global == v + begin_vertex_id) continue;      // self-loop
+
+            vertex_t neighbor_id = nb_global;
             int pe_dst;
             locating_vertex(pe_dst, neighbor_id, private_device_part_vertex_offset, n_pes);
             const vertex_t dst_community_id = (pe_dst == my_pe)
@@ -1757,6 +1827,7 @@ move_vertices_warp(
 
             const weight_t w = private_device_edge_weight[e];
             const weight_t w_norm = (directed && sv > 0.) ? w / sv : w;
+            tot_out += w_norm;
 
             if (dst_community_id != src_community_id) {
                 vertex_t h = (vertex_t)(((unsigned long long)dst_community_id * 107ULL) % hash_size);
@@ -1768,11 +1839,12 @@ move_vertices_warp(
                     }
                     h = (h + 1) % hash_size;   // at most half full -> always terminates
                 }
-            } else if (private_device_edge[e] != v + begin_vertex_id) {
+            } else {
                 eici += w_norm;
             }
         }
-        eici = cg::reduce(warp, eici, cg::plus<weight_t>());
+        eici    = cg::reduce(warp, eici,    cg::plus<weight_t>());
+        tot_out = cg::reduce(warp, tot_out, cg::plus<weight_t>());
         warp.sync();
 
         // Directed: walk in-flow into v from each module. Look up (never insert) so the
@@ -1782,6 +1854,7 @@ move_vertices_warp(
         if (directed) {
             for (edge_t e = in_offset[v] + warp.thread_rank(); e < in_offset[v + 1]; e += 32) {
                 vertex_t u = in_edge[e];
+                if (u == v + begin_vertex_id) continue;   // self-loop: moves with v, never exits
                 int pe_u;
                 locating_vertex(pe_u, u, private_device_part_vertex_offset, n_pes);
                 if (pe_u != my_pe) continue;
@@ -1812,15 +1885,25 @@ move_vertices_warp(
         vertex_t src_local = src_community_id;
         int pe_src;
         locating_vertex(pe_src, src_local, private_device_part_vertex_offset, n_pes);
-        weight_t aci, qout_m;
+        weight_t aci, qout_m, n_m = 0., d_m = 0.;
         if (pe_src == my_pe) {
             aci    = shared_device_community_weight[src_local];
             qout_m = shared_device_community_q_out[src_local];
+            if (directed) {
+                n_m = community_node_count[src_local];
+                d_m = community_dangling_flow[src_local];
+            }
         } else {
             aci    = nvshmem_double_g(shared_device_community_weight + src_local, pe_src);
             qout_m = nvshmem_double_g(shared_device_community_q_out + src_local, pe_src);
+            if (directed) {
+                n_m = nvshmem_double_g(community_node_count + src_local, pe_src);
+                d_m = nvshmem_double_g(community_dangling_flow + src_local, pe_src);
+            }
         }
         aci -= ki;   // move_gain expects vol(m) - k_v
+        const weight_t nc_v = directed ? node_count[v] : (weight_t)0.;
+        const weight_t d_v  = directed ? dangling_flow[v] : (weight_t)0.;
 
         // Score every candidate community; each lane scans its own stride of slots.
         weight_t best_gain = 0.;                    // only strictly-improving moves are taken
@@ -1832,19 +1915,28 @@ move_vertices_warp(
             vertex_t cand_local = cand;
             int pe_c;
             locating_vertex(pe_c, cand_local, private_device_part_vertex_offset, n_pes);
-            weight_t acj, qout_n;
+            weight_t acj, qout_n, n_n = 0., d_n = 0.;
             if (pe_c == my_pe) {
                 acj    = shared_device_community_weight[cand_local];
                 qout_n = shared_device_community_q_out[cand_local];
+                if (directed) {
+                    n_n = community_node_count[cand_local];
+                    d_n = community_dangling_flow[cand_local];
+                }
             } else {
                 acj    = nvshmem_double_g(shared_device_community_weight + cand_local, pe_c);
                 qout_n = nvshmem_double_g(shared_device_community_q_out + cand_local, pe_c);
+                if (directed) {
+                    n_n = nvshmem_double_g(community_node_count + cand_local, pe_c);
+                    d_n = nvshmem_double_g(community_dangling_flow + cand_local, pe_c);
+                }
             }
 
             weight_t g;
             if (directed) {
                 g = move_gain_directed_approx(ki, aci + ki, acj, qout_m, qout_n, q_total,
-                                              eici, hash_val[s], tau, in_m, hash_in_val[s]);
+                                              eici, hash_val[s], tau, in_m, hash_in_val[s],
+                                              tot_out, n_m, n_n, nc_v, N_total, d_m, d_n, d_v);
             } else {
                 g = move_gain<ACTIVE_OBJECTIVE>(hash_val[s], eici, ki, aci, acj,
                                                 qout_m, qout_n, q_total, mass);
@@ -1908,7 +2000,12 @@ void calculate_eicj_and_move_vertex_warp(
     double tau,
     vertex_t* in_offset,
     edge_t* in_edge,
-    weight_t* in_edge_weight)
+    weight_t* in_edge_weight,
+    weight_t* node_count,
+    weight_t* community_node_count,
+    weight_t* dangling_flow,
+    weight_t* community_dangling_flow,
+    weight_t  N_total)
 {
     const int block_num = 256;                       // 8 warps per block
     int grid_num = (int) iDivUp(local_vertices, (vertex_t)(block_num / 32));
@@ -1923,7 +2020,8 @@ void calculate_eicj_and_move_vertex_warp(
         shared_device_community_weight, shared_device_community_q_out, Q_sum,
         hash_key, hash_val, hash_in_val,
         mass, my_pe, n_pes, up_down,
-        s_out_local, tau, in_offset, in_edge, in_edge_weight);
+        s_out_local, tau, in_offset, in_edge, in_edge_weight,
+        node_count, community_node_count, dangling_flow, community_dangling_flow, N_total);
     CUDA_RT_CALL(cudaGetLastError());                // the binned path never checked this
     CUDA_RT_CALL(cudaStreamSynchronize(stream));
 }
@@ -2420,7 +2518,12 @@ static void launch_compute_codelength(
     weight_t* s_out = nullptr,
     double tau = 0.0,
     // level-0 Sum_v F(p_vis_v); nullptr = derive from this level's vertex weights
-    weight_t* s_node_level0 = nullptr)
+    weight_t* s_node_level0 = nullptr,
+    // directed: per-module node count n_i (original nodes) and the total N, for the
+    // unrecorded-teleportation q_out
+    weight_t* community_node_count = nullptr,
+    weight_t* community_dangling_flow = nullptr,
+    weight_t  N_total = 1.0)
 {
     int grid_size = 0;
 
@@ -2470,7 +2573,8 @@ static void launch_compute_codelength(
     if (s_out != nullptr) {
         weight_t tau_f = (weight_t)tau;
         apply_teleportation_q_out<<<80, 1024, 0, default_stream>>>(
-            local_vertices, tau_f, shared_device_community_weight, shared_device_community_q_out);
+            local_vertices, tau_f, shared_device_community_weight, shared_device_community_q_out,
+            community_node_count, community_dangling_flow, N_total);
         CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
     }
 
@@ -2487,6 +2591,124 @@ static void launch_compute_codelength(
     NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_codelength, grid_size, block_dims, a3, d_shared_mem, default_stream));
     nvshmemx_barrier_all_on_stream(default_stream);
     CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+}
+
+// ---------------------------------------------------------------------------
+// B6: directed coarsening.
+//
+// Coarsening a directed FLOW graph is only exact if you aggregate the walk flow rather than
+// the raw edge weights (proved in tools/directed_coarsen_check.py, error 0.0e+00):
+//
+//   coarse edge   f(C,D) = sum_{u in C, v in D, u->v} p_u * w(u,v) / s_out(u)
+//   coarse flow   p_C    = sum_{v in C} p_v          (== community_weight at phase end)
+//   coarse s_out  s_out(C) := p_C
+//
+// s_out(C) must be p_C and NOT sum_D f(C,D): dangling vertices (out-degree 0 -- wiki-Vote has
+// 2187 of them) carry flow but emit none, so the two differ by the dangling mass and using the
+// latter costs +2.39 bits. With s_out(C) = p_C the kernels' p_C * f(C,D)/s_out(C) collapses to
+// exactly f(C,D), which is the module's true walk exit flow at the ORIGINAL level.
+//
+// Rescaling the out-CSR to the walk flow is IDEMPOTENT at coarse levels: there edge_weight is
+// already f and s_out == vertex_weight == p_C, so p_C * f / p_C = f. The same kernel therefore
+// runs before every coarsening.
+__global__ void scale_edges_to_walk_flow(
+    vertex_t local_vertices,
+    vertex_t* private_device_offset,
+    weight_t* private_device_edge_weight,
+    weight_t* private_device_vertex_weight,   // p_v
+    weight_t* s_out
+)
+{
+    cg::grid_group grid = cg::this_grid();
+    for (vertex_t v = grid.thread_rank(); v < local_vertices; v += grid.num_threads()) {
+        const weight_t sv = s_out[v];
+        const weight_t pv = private_device_vertex_weight[v];
+        for (edge_t e = private_device_offset[v]; e < private_device_offset[v + 1]; ++e) {
+            private_device_edge_weight[e] = (sv > 0.)
+                ? (weight_t)((double)pv * (double)private_device_edge_weight[e] / (double)sv)
+                : (weight_t)0.;
+        }
+    }
+}
+
+// p_C = sum_{v in C} p_v, indexed by the DENSE coarse id. Run right after coarsen_graph, while
+// community_ids still maps each old vertex to its dense coarse id (renew_community_id_cuda) and
+// vertex_weight still holds the old level's p_v.
+__global__ void aggregate_coarse_flow(
+    vertex_t prev_local_vertices,
+    vertex_t* dense_coarse_id,                // old vertex -> DENSE coarse id
+    weight_t* private_device_vertex_weight,   // old p_v
+    weight_t* coarse_p
+)
+{
+    cg::grid_group grid = cg::this_grid();
+    for (vertex_t v = grid.thread_rank(); v < prev_local_vertices; v += grid.num_threads()) {
+        atomicAdd(coarse_p + dense_coarse_id[v], private_device_vertex_weight[v]);
+    }
+}
+
+// Level 0: a vertex is dangling iff it has no out-links (s_out == 0); its whole visit rate is
+// dangling flow. At coarse levels this is carried by aggregate_coarse_flow instead.
+__global__ void init_dangling_flow(
+    vertex_t local_vertices,
+    weight_t* s_out,
+    weight_t* p_vis,
+    weight_t* dangling_flow
+)
+{
+    cg::grid_group grid = cg::this_grid();
+    for (vertex_t v = grid.thread_rank(); v < local_vertices; v += grid.num_threads()) {
+        dangling_flow[v] = (s_out[v] <= 0.) ? p_vis[v] : (weight_t)0.;
+    }
+}
+
+__global__ void fill_weight(weight_t* a, vertex_t n, weight_t val)
+{
+    cg::grid_group grid = cg::this_grid();
+    for (vertex_t i = grid.thread_rank(); i < n; i += grid.num_threads()) a[i] = val;
+}
+
+// Rebuild the coarse in-CSR by transposing the coarse out-CSR. Done on the host: the coarse
+// graph is small (it only shrinks) and this runs once per phase, so it is not worth a device
+// sort. -np 1 only, which is also the only regime where the directed in-flow gain is exact.
+static void rebuild_coarse_in_csr(
+    vertex_t local_vertices,
+    edge_t   local_edges,
+    vertex_t* d_offset, edge_t* d_edge, weight_t* d_edge_weight,
+    vertex_t* d_in_offset, edge_t* d_in_edge, weight_t* d_in_edge_weight,
+    cudaStream_t stream)
+{
+    std::vector<vertex_t> off(local_vertices + 1);
+    std::vector<edge_t>   edg(local_edges);
+    std::vector<weight_t> wgt(local_edges);
+    CUDA_RT_CALL(cudaMemcpy(off.data(), d_offset, sizeof(vertex_t) * (local_vertices + 1), cudaMemcpyDeviceToHost));
+    if (local_edges > 0) {
+        CUDA_RT_CALL(cudaMemcpy(edg.data(), d_edge, sizeof(edge_t) * local_edges, cudaMemcpyDeviceToHost));
+        CUDA_RT_CALL(cudaMemcpy(wgt.data(), d_edge_weight, sizeof(weight_t) * local_edges, cudaMemcpyDeviceToHost));
+    }
+
+    std::vector<vertex_t> in_off(local_vertices + 1, 0);
+    for (edge_t e = 0; e < local_edges; ++e) in_off[edg[e] + 1]++;
+    for (vertex_t v = 0; v < local_vertices; ++v) in_off[v + 1] += in_off[v];
+
+    std::vector<edge_t>   in_edg(local_edges);
+    std::vector<weight_t> in_wgt(local_edges);
+    std::vector<vertex_t> cursor(in_off.begin(), in_off.end() - 1);
+    for (vertex_t u = 0; u < local_vertices; ++u) {
+        for (edge_t e = off[u]; e < off[u + 1]; ++e) {
+            const vertex_t dst = edg[e];
+            const vertex_t pos = cursor[dst]++;
+            in_edg[pos] = u;              // in_edge holds the SOURCE id (global == local at -np 1)
+            in_wgt[pos] = wgt[e];
+        }
+    }
+
+    CUDA_RT_CALL(cudaMemcpy(d_in_offset, in_off.data(), sizeof(vertex_t) * (local_vertices + 1), cudaMemcpyHostToDevice));
+    if (local_edges > 0) {
+        CUDA_RT_CALL(cudaMemcpy(d_in_edge, in_edg.data(), sizeof(edge_t) * local_edges, cudaMemcpyHostToDevice));
+        CUDA_RT_CALL(cudaMemcpy(d_in_edge_weight, in_wgt.data(), sizeof(weight_t) * local_edges, cudaMemcpyHostToDevice));
+    }
+    CUDA_RT_CALL(cudaStreamSynchronize(stream));
 }
 }  // namespace louvain
 
@@ -2520,6 +2742,10 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     // later phase so that L stays the codelength of the partition (see compute_codelength).
     weight_t *s_node_level0 = nullptr;
     double prev_phase_final_L = 0.0;
+
+    // B6: p_C for the level produced by the last coarsening. Non-null from Phase 1 on in a
+    // directed run; it overrides both vertex_weight (node flow) and s_out at the coarse level.
+    weight_t *coarse_p = nullptr;
 
     // Flat map from an ORIGINAL vertex to its community at the current level. Each phase
     // composes this with the level's assignment, so after the last phase it is the full
@@ -2567,6 +2793,13 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 
     // directed-mode PageRank scratch
     const bool directed = gpuGraph->is_directed_();
+
+    if (directed && n_pes > 1 && my_pe == 0) {
+        printf("[WARN] directed multi-level (B6) requires -np 1: the coarse in-CSR rebuild and the\n"
+               "       in-flow gain both need a local view. At -np %d only Phase 0 is directed;\n"
+               "       later phases fall back to the undirected objective.\n", n_pes);
+    }
+
     weight_t *pr_p_cur   = nullptr;  // NVSHMEM: symmetric current p (remote PEs read it)
     weight_t *pr_p_new   = nullptr;  // local-only scratch for PageRank new p
     weight_t *pr_reduce  = nullptr;  // NVSHMEM: 2 doubles [dangling_mass, l1_norm]
@@ -2619,6 +2852,30 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     CUDA_RT_CALL(cudaMalloc((void **) &cq_backup,   max_total_vertices * sizeof(weight_t)));
     CUDA_RT_CALL(cudaMalloc((void **) &qsum_backup, sizeof(weight_t)));
 
+    // Unrecorded teleportation needs n_i, the number of ORIGINAL nodes per module. Like the
+    // flow, it has to be carried through coarsening (a coarse super-node stands for many
+    // original nodes), and like community_weight it has to be maintained incrementally across
+    // moves and rolled back on a rejected pass.
+    const weight_t N_total = (weight_t) max_total_vertices;
+    weight_t *node_count           = nullptr;   // per-vertex nc[v] (1 at level 0)
+    weight_t *community_node_count = nullptr;   // per-module n_i  (NVSHMEM: candidates may be remote)
+    weight_t *cn_backup            = nullptr;   // n_i of the last accepted partition
+    weight_t *coarse_nc            = nullptr;   // nc of the level produced by the last coarsening
+    // Dangling flow: a node with no out-links must teleport (probability 1, not tau), so its
+    // exit flow is charged in full. Tracked exactly like the node count.
+    weight_t *dangling_flow           = nullptr;
+    weight_t *community_dangling_flow = nullptr;
+    weight_t *cd_backup               = nullptr;
+    weight_t *coarse_df               = nullptr;
+    if (directed) {
+        CUDA_RT_CALL(cudaMalloc((void **) &node_count, max_total_vertices * sizeof(weight_t)));
+        community_node_count = (weight_t *) nvshmem_malloc(max_total_vertices * sizeof(weight_t));
+        CUDA_RT_CALL(cudaMalloc((void **) &cn_backup, max_total_vertices * sizeof(weight_t)));
+        CUDA_RT_CALL(cudaMalloc((void **) &dangling_flow, max_total_vertices * sizeof(weight_t)));
+        community_dangling_flow = (weight_t *) nvshmem_malloc(max_total_vertices * sizeof(weight_t));
+        CUDA_RT_CALL(cudaMalloc((void **) &cd_backup, max_total_vertices * sizeof(weight_t)));
+    }
+
     int block_dims = 1024;
     int grid_size = 0;
     size_t d_shared_mem = 0;
@@ -2650,11 +2907,11 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     start_total = MPI_Wtime();
     while (phase_num < max_phases && (Q_host - Q_old_host) > threshold) {
 
-        // Directed mode is only fully supported in Phase 0 (before coarsening).
-        // Phase 1+ uses the coarsened out-CSR (undirected symmetrized), so the in-CSR
-        // would be stale. Fall back to undirected coarsening path for Phase 1+.
-        // B6 (full directed coarsening) is future work.
-        bool phase_directed = directed && (phase_num == 0);
+        // B6: directed coarsening keeps the flow model at every level (walk-flow edges,
+        // p_C node flow, s_out(C) = p_C, rebuilt in-CSR), so directed is no longer a
+        // Phase-0-only mode. It requires -np 1, which is also the only regime where the
+        // directed in-flow gain is exact (remote in-neighbours have no symmetric p[u]).
+        bool phase_directed = directed && (n_pes == 1 || phase_num == 0);
 
         weight_t new_Q;
         weight_t cur_Q;
@@ -2684,9 +2941,31 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                                  private_device_vertex_weight);
         CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
+        // 2a. Directed: node counts for the unrecorded-teleportation term. 1 per vertex at
+        //     level 0; at a coarse level, nc[C] = |C| in ORIGINAL nodes (carried by coarsening).
+        if (directed) {
+            if (phase_num == 0 || coarse_nc == nullptr) {
+                fill_weight<<<80, 1024, 0, default_stream>>>(node_count, local_vertices, (weight_t)1.0);
+            } else {
+                copy<weight_t><<<80, 1024, 0, default_stream>>>(coarse_nc, node_count, local_vertices);
+            }
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+        }
+
         // 2b. Directed mode: replace k_v with PageRank ergodic visit probability p_vis[v].
         //     Normalize k_v to probability units first (uniform init), then iterate.
-        if (phase_directed) {
+        if (phase_directed && phase_num > 0 && coarse_p != nullptr) {
+            // B6 coarse level: the flow is already known exactly -- p_C was accumulated at the
+            // last coarsening. Do NOT re-run PageRank (teleportation over N_coarse nodes is a
+            // different Markov chain, so it would not reproduce p_C = sum_{v in C} p_v), and do
+            // NOT keep reduce_vertices_weights' answer (that is sum_D f(C,D), which is short by
+            // the dangling mass). s_out(C) := p_C makes the kernels' p_C*f/s_out collapse to f.
+            copy<weight_t><<<80, 1024, 0, default_stream>>>(coarse_p, private_device_vertex_weight, local_vertices);
+            copy<weight_t><<<80, 1024, 0, default_stream>>>(coarse_p, pr_s_out, local_vertices);
+            copy<weight_t><<<80, 1024, 0, default_stream>>>(coarse_df, dangling_flow, local_vertices);
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+            mass = 1.0;
+        } else if (phase_directed) {
             // Initialize p_vis = k_v / Σk_v  (out-strength as initial distribution)
             CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
             weight_t local_sum = thrust::reduce(
@@ -2721,7 +3000,12 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                             block_dims, d_shared_mem, default_stream);
             copy<weight_t><<<80, 1024, 0, default_stream>>>(pr_p_cur, private_device_vertex_weight, local_vertices);
             CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
-            // After convergence: p_vis is in private_device_vertex_weight (normalized, Σ = 1)
+            // After convergence: p_vis is in private_device_vertex_weight (normalized, Σ = 1).
+            // A vertex with no out-links is dangling: all of its flow leaves by teleportation.
+            init_dangling_flow<<<80, 1024, 0, default_stream>>>(
+                local_vertices, pr_s_out, private_device_vertex_weight, dangling_flow);
+            CUDA_RT_CALL(cudaGetLastError());
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
             // Override mass to 1.0 so codelength uses probability units.
             mass = 1.0;
         } else if (phase_num > 0) {
@@ -2734,6 +3018,11 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         // The inner move-loop updates this incrementally after each reassignment.
         // NOTE: copy(src, dst, len) does dst[i] = src[i]; here dst = community_weight.
         copy<weight_t><<<80, 1024, 0, default_stream>>>(private_device_vertex_weight, shared_device_community_weight, local_vertices);
+        if (directed) {
+            // same seeding for n_i and d_i: singleton partition -> per-module == per-vertex
+            copy<weight_t><<<80, 1024, 0, default_stream>>>(node_count, community_node_count, local_vertices);
+            copy<weight_t><<<80, 1024, 0, default_stream>>>(dangling_flow, community_dangling_flow, local_vertices);
+        }
         CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
         // 3. Compute the initial codelength score (-L) of this phase
@@ -2744,7 +3033,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                   shared_device_community_delta_weight, private_device_vertex_weight,
                                   cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream,
                                   phase_directed ? pr_s_out : nullptr, phase_directed ? tau : 0.0,
-                                  s_node_level0);
+                                  s_node_level0, community_node_count, community_dangling_flow, N_total);
 
         CUDA_RT_CALL(cudaMemcpy(&new_Q, Q, sizeof(weight_t) , cudaMemcpyDeviceToHost));
 
@@ -2752,10 +3041,12 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         // later phase. Coarsening merges nodes into super-nodes with larger visit rates, so
         // re-deriving this term per level silently changes the objective: L stops being the
         // codelength of the partition and the outer phase loop compares incomparable numbers.
-        // (Skipped for directed runs: Phase 1+ currently falls back to the undirected
-        // objective on the symmetrized coarse graph, a different objective in different
-        // units, so no single constant is valid. Directed coarsening -- B6 -- fixes that.)
-        if (phase_num == 0 && !directed && s_node_level0 == nullptr) {
+        // With B6 the directed levels keep the same flow objective (mass = 1 throughout), so
+        // the same constant is valid there too -- but only where B6 runs. A directed run at
+        // -np > 1 still drops to the undirected objective (different units) after Phase 0, so
+        // no single constant is valid there.
+        const bool objective_is_stable = (!directed || n_pes == 1);
+        if (phase_num == 0 && objective_is_stable && s_node_level0 == nullptr) {
             CUDA_RT_CALL(cudaMalloc((void **) &s_node_level0, sizeof(weight_t)));
             CUDA_RT_CALL(cudaMemcpy(s_node_level0, cl_reduce + 3, sizeof(weight_t),
                                     cudaMemcpyDeviceToDevice));
@@ -2764,7 +3055,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         // Phase continuity: a singleton partition of the coarse graph IS the partition the
         // previous phase ended on, so its codelength must be identical. If this trips, the
         // objective is being re-based across levels and the multi-level L is meaningless.
-        if (my_pe == 0 && phase_num > 0 && !directed) {
+        if (my_pe == 0 && phase_num > 0 && objective_is_stable) {
             const double L_now = -(double)new_Q;
             if (fabs(L_now - prev_phase_final_L) > 1.0e-6) {
                 printf("[WARN] codelength not conserved across coarsening: phase %d ended at "
@@ -2786,6 +3077,14 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                      cudaMemcpyDeviceToDevice, default_stream));
         CUDA_RT_CALL(cudaMemcpyAsync(qsum_backup, Q_sum, sizeof(weight_t),
                                      cudaMemcpyDeviceToDevice, default_stream));
+        if (directed) {
+            CUDA_RT_CALL(cudaMemcpyAsync(cn_backup, community_node_count,
+                                         local_vertices * sizeof(weight_t),
+                                         cudaMemcpyDeviceToDevice, default_stream));
+            CUDA_RT_CALL(cudaMemcpyAsync(cd_backup, community_dangling_flow,
+                                         local_vertices * sizeof(weight_t),
+                                         cudaMemcpyDeviceToDevice, default_stream));
+        }
         CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
         if(my_pe == 0) {
@@ -2842,7 +3141,12 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                                     phase_directed ? tau : 0.0,
                                                     phase_directed ? pr_in_offset : nullptr,
                                                     phase_directed ? pr_in_edge : nullptr,
-                                                    phase_directed ? pr_in_edge_weight : nullptr);
+                                                    phase_directed ? pr_in_edge_weight : nullptr,
+                                                    node_count,
+                                                    community_node_count,
+                                                    dangling_flow,
+                                                    community_dangling_flow,
+                                                    N_total);
             } else {
             calculate_eicj_and_move_vertex_bin(local_vertices,
                                                 begin_vertex_id,
@@ -2907,6 +3211,60 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
             nvshmemx_barrier_all_on_stream(default_stream);
             CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
 
+            // b2) directed: the same incremental update for the module NODE COUNTS n_i, which
+            // the unrecorded-teleportation q_out depends on. Identical kernels, different
+            // arrays -- the delta buffer is re-zeroed by the kernel, so it can be reused.
+            if (directed) {
+                void *kernel_args_ccn[] = {
+                        (void *) &local_vertices,
+                        (void *) &total_vertices,
+                        (void *) &node_count,
+                        (void *) &shared_device_community_ids,
+                        (void *) &shared_device_community_ids_new,
+                        (void *) &community_node_count,
+                        (void *) &shared_device_community_delta_weight,
+                        (void *) &private_device_part_vertex_offset,
+                        (void *) &my_pe,
+                        (void *) &n_pes
+                };
+                NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_community_weight_local_atomic, block_dims, kernel_args_ccn, d_shared_mem, &grid_size));
+                nvshmem_barrier_all();
+                NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_weight_local_atomic, grid_size, block_dims, kernel_args_ccn, d_shared_mem, default_stream));
+                nvshmemx_barrier_all_on_stream(default_stream);
+                CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
+                NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_community_weight, block_dims, kernel_args_ccn, d_shared_mem, &grid_size));
+                nvshmem_barrier_all();
+                NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_weight, grid_size, block_dims, kernel_args_ccn, d_shared_mem, default_stream));
+                nvshmemx_barrier_all_on_stream(default_stream);
+                CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
+                // ... and the same again for the per-module DANGLING flow d_i.
+                void *kernel_args_ccd[] = {
+                        (void *) &local_vertices,
+                        (void *) &total_vertices,
+                        (void *) &dangling_flow,
+                        (void *) &shared_device_community_ids,
+                        (void *) &shared_device_community_ids_new,
+                        (void *) &community_dangling_flow,
+                        (void *) &shared_device_community_delta_weight,
+                        (void *) &private_device_part_vertex_offset,
+                        (void *) &my_pe,
+                        (void *) &n_pes
+                };
+                NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_community_weight_local_atomic, block_dims, kernel_args_ccd, d_shared_mem, &grid_size));
+                nvshmem_barrier_all();
+                NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_weight_local_atomic, grid_size, block_dims, kernel_args_ccd, d_shared_mem, default_stream));
+                nvshmemx_barrier_all_on_stream(default_stream);
+                CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
+                NVSHMEM_CHECK(nvshmemx_collective_launch_query_gridsize((void *)compute_community_weight, block_dims, kernel_args_ccd, d_shared_mem, &grid_size));
+                nvshmem_barrier_all();
+                NVSHMEM_CHECK(nvshmemx_collective_launch((void *)compute_community_weight, grid_size, block_dims, kernel_args_ccd, d_shared_mem, default_stream));
+                nvshmemx_barrier_all_on_stream(default_stream);
+                CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+            }
+
             stop_in_loop = MPI_Wtime();
             update_weight_time += (stop_in_loop - start_in_loop);
             start_in_loop = MPI_Wtime();
@@ -2919,7 +3277,7 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                       shared_device_community_delta_weight, private_device_vertex_weight,
                                       cl_reduce, Q, Q_sum, my_pe, n_pes, block_dims, d_shared_mem, default_stream,
                                       phase_directed ? pr_s_out : nullptr, phase_directed ? tau : 0.0,
-                                      s_node_level0);
+                                      s_node_level0, community_node_count, community_dangling_flow, N_total);
 
             stop_in_loop = MPI_Wtime();
             compute_modularity_time += (stop_in_loop - start_in_loop);
@@ -2942,6 +3300,14 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                              cudaMemcpyDeviceToDevice, default_stream));
                 CUDA_RT_CALL(cudaMemcpyAsync(qsum_backup, Q_sum, sizeof(weight_t),
                                              cudaMemcpyDeviceToDevice, default_stream));
+                if (directed) {
+                    CUDA_RT_CALL(cudaMemcpyAsync(cn_backup, community_node_count,
+                                                 local_vertices * sizeof(weight_t),
+                                                 cudaMemcpyDeviceToDevice, default_stream));
+                    CUDA_RT_CALL(cudaMemcpyAsync(cd_backup, community_dangling_flow,
+                                                 local_vertices * sizeof(weight_t),
+                                                 cudaMemcpyDeviceToDevice, default_stream));
+                }
                 CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
             } else {
                 new_Q = cur_Q;
@@ -2964,6 +3330,14 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
                                              cudaMemcpyDeviceToDevice, default_stream));
                 CUDA_RT_CALL(cudaMemcpyAsync(Q_sum, qsum_backup, sizeof(weight_t),
                                              cudaMemcpyDeviceToDevice, default_stream));
+                if (directed) {
+                    CUDA_RT_CALL(cudaMemcpyAsync(community_node_count, cn_backup,
+                                                 local_vertices * sizeof(weight_t),
+                                                 cudaMemcpyDeviceToDevice, default_stream));
+                    CUDA_RT_CALL(cudaMemcpyAsync(community_dangling_flow, cd_backup,
+                                                 local_vertices * sizeof(weight_t),
+                                                 cudaMemcpyDeviceToDevice, default_stream));
+                }
                 CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
             }
 
@@ -3010,13 +3384,24 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 
         // Phase continuation is driven by this phase's own improvement (final vs. initial
         // score). With the level-0 node-entropy term pinned (s_node_level0) the codelength is
-        // now conserved across coarsening, so comparing across levels would work too for the
-        // undirected path -- but not yet for directed, whose Phase 1+ changes objective.
+        // conserved across coarsening, so comparing across levels would work too.
         Q_old_host = phase_initial_score;
         Q_host = new_Q;
         if ((Q_host - Q_old_host) <= threshold) break;
 
         start_phase = MPI_Wtime();
+
+        // B6: coarsen the FLOW, not the raw weights. Rescale the out-CSR to the walk flow
+        // p_u*w(u,v)/s_out(u) so the existing aggregation produces f(C,D) directly. Idempotent
+        // at coarse levels (edge_weight is already f and s_out == p_C there).
+        const vertex_t prev_local_vertices = local_vertices;
+        if (phase_directed) {
+            scale_edges_to_walk_flow<<<80, 1024, 0, default_stream>>>(
+                local_vertices, private_device_offset, private_device_edge_weight,
+                private_device_vertex_weight, pr_s_out);
+            CUDA_RT_CALL(cudaGetLastError());
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+        }
 
         coarsen_graph_mg::coarsen_graph(hostGraph, gpuGraph, my_pe, n_pes, default_stream, streams, symbolic_time, numeric_time);
 
@@ -3030,8 +3415,57 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         local_vertices = gpuGraph->get_local_vertices_();
         total_vertices = gpuGraph->get_total_vertices_();
 
-        // In directed mode, the in-CSR is NOT rebuilt by coarsen_graph (B6 is not yet implemented).
-        // The directed path is only active for Phase 0; Phase 1+ uses undirected coarsened graph.
+        // B6: finish the coarse flow graph. coarsen_graph has just aggregated the (rescaled)
+        // edge weights into f(C,D), and community_ids still maps each OLD vertex to its dense
+        // coarse id (renew_community_id_cuda) while vertex_weight still holds the old p_v --
+        // so this is the one window in which p_C can be accumulated.
+        if (phase_directed) {
+            CUDA_RT_CALL(cudaFree(coarse_p));
+            CUDA_RT_CALL(cudaMalloc((void **) &coarse_p, sizeof(weight_t) * local_vertices));
+            fill_weight<<<80, 1024, 0, default_stream>>>(coarse_p, local_vertices, (weight_t)0.);
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+            // NB: coarsen_graph renumbers into the _NEW buffer, not community_ids --
+            // shared_device_community_ids_global == get_shared_device_community_ids_new_().
+            // So the dense old-vertex -> coarse-id map lives there.
+            aggregate_coarse_flow<<<80, 1024, 0, default_stream>>>(
+                prev_local_vertices, shared_device_community_ids_new,
+                private_device_vertex_weight, coarse_p);
+            CUDA_RT_CALL(cudaGetLastError());
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
+            // n_i counts ORIGINAL nodes, so the node count is carried through coarsening the
+            // same way as the flow: nc[C] = sum_{v in C} nc[v]. Without this the teleport
+            // factor (N - n_i)/N would be computed over super-nodes and the objective would be
+            // silently re-based at every level, exactly like the node-entropy term was.
+            CUDA_RT_CALL(cudaFree(coarse_nc));
+            CUDA_RT_CALL(cudaMalloc((void **) &coarse_nc, sizeof(weight_t) * local_vertices));
+            fill_weight<<<80, 1024, 0, default_stream>>>(coarse_nc, local_vertices, (weight_t)0.);
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+            aggregate_coarse_flow<<<80, 1024, 0, default_stream>>>(
+                prev_local_vertices, shared_device_community_ids_new,
+                node_count, coarse_nc);
+            CUDA_RT_CALL(cudaGetLastError());
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
+            // ... and the dangling flow, for the same reason: d_i must count ORIGINAL dangling
+            // nodes, so a super-node has to remember how much of its flow is dangling.
+            CUDA_RT_CALL(cudaFree(coarse_df));
+            CUDA_RT_CALL(cudaMalloc((void **) &coarse_df, sizeof(weight_t) * local_vertices));
+            fill_weight<<<80, 1024, 0, default_stream>>>(coarse_df, local_vertices, (weight_t)0.);
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+            aggregate_coarse_flow<<<80, 1024, 0, default_stream>>>(
+                prev_local_vertices, shared_device_community_ids_new,
+                dangling_flow, coarse_df);
+            CUDA_RT_CALL(cudaGetLastError());
+            CUDA_RT_CALL(cudaStreamSynchronize(default_stream));
+
+            // The coarse graph is directed, so the in-CSR must be rebuilt (coarsen only emits
+            // the out-CSR). Coarse edges <= original edges, so the level-0 in-CSR buffers fit.
+            rebuild_coarse_in_csr(local_vertices, gpuGraph->get_local_edges_(),
+                                  private_device_offset, private_device_edge, private_device_edge_weight,
+                                  pr_in_offset, pr_in_edge, pr_in_edge_weight, default_stream);
+        }
+
         // Reallocate p_new scratch for the new (smaller) local vertex count.
         if (directed) {
             CUDA_RT_CALL(cudaFree(pr_p_new));
@@ -3083,6 +3517,15 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
     CUDA_RT_CALL(cudaFree(cq_backup));
     CUDA_RT_CALL(cudaFree(qsum_backup));
     if (s_node_level0 != nullptr) CUDA_RT_CALL(cudaFree(s_node_level0));
+    if (coarse_p != nullptr) CUDA_RT_CALL(cudaFree(coarse_p));
+    if (coarse_nc != nullptr) CUDA_RT_CALL(cudaFree(coarse_nc));
+    if (node_count != nullptr) CUDA_RT_CALL(cudaFree(node_count));
+    if (cn_backup != nullptr) CUDA_RT_CALL(cudaFree(cn_backup));
+    if (community_node_count != nullptr) nvshmem_free(community_node_count);
+    if (coarse_df != nullptr) CUDA_RT_CALL(cudaFree(coarse_df));
+    if (dangling_flow != nullptr) CUDA_RT_CALL(cudaFree(dangling_flow));
+    if (cd_backup != nullptr) CUDA_RT_CALL(cudaFree(cd_backup));
+    if (community_dangling_flow != nullptr) nvshmem_free(community_dangling_flow);
     if (mv_hash_key    != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_key));
     if (mv_hash_val    != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_val));
     if (mv_hash_in_val != nullptr) CUDA_RT_CALL(cudaFree(mv_hash_in_val));
