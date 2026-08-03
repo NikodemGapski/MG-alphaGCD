@@ -126,6 +126,24 @@ int main(int argc, char* argv[]){
         setenv("NVSHMEM_SYMMETRIC_SIZE", symmetric_heap_size_str, 1);
     }
 
+    // -np 2 deadlocks HERE, not in the multi-GPU algorithm (job 216155 and every
+    // follow-up blamed the coarsening / move path, which is never reached -- the
+    // run dies during nvshmem init, right after the graph header is printed).
+    //
+    // DO NOT "fix" this by switching to nvshmem_init() (the PMI bootstrap). That
+    // was tried: it does not hang, but it does not give a real 2-PE job either --
+    // both ranks silently become PE 0 of a 1-PE world (confirmed: "[PE 0] ...
+    // part=[0,V)" printed twice, never a "[PE 1]"), i.e. two independent copies
+    // of the whole -np 1 run. A matching final codelength between "-np 1" and
+    // "-np 2" is NOT evidence this works -- that agreement is the symptom.
+    //
+    // The real root cause (see notes/infomap-branch-status.md sec 10): cross-GPU
+    // cudaIpcOpenMemHandle succeeds but the peer's write is never observed, on
+    // every node tested (2 GPU generations, 2 driver versions), including with
+    // both PEs pinned to a single GPU. That is a cluster/driver fault, not
+    // something either bootstrap can route around. Confirmed via NVSHMEM's own
+    // put-block / mpi-based-init examples with no MG-alphaGCD code involved.
+    // Multi-GPU cannot work here until that is fixed at the infrastructure level.
     NVSHMEM_CHECK(nvshmemx_init_attr(NVSHMEMX_INIT_WITH_MPI_COMM, &attr));
 
     //----------------------------------------------------------------/

@@ -15,6 +15,17 @@ enable_language(CUDA)
 
 add_definitions(-DTIMING)
 
+# Make thrust::host mean OpenMP, not the serial CPP backend.
+#
+# The symmetric-.mtx loader builds its CSR with
+# thrust::stable_sort_by_key(thrust::host, ...) (src/mmio/mmio_wrapper.cu), and
+# compute_total_edge_weight() uses thrust::reduce on raw host pointers
+# (src/graph/host_graph.cpp). Without THRUST_HOST_SYSTEM both dispatch to the
+# single-threaded backend, which dominates load time on large graphs -- tens of
+# minutes for a billion-edge file. stable_sort stays stable under OMP, so edge
+# ordering (and therefore run-to-run determinism) is unchanged.
+add_definitions(-DTHRUST_HOST_SYSTEM=THRUST_HOST_SYSTEM_OMP)
+
 add_executable(MG_GCD
         include/mmio/mmio.h
         include/mmio/mmio_wrapper.h

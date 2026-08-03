@@ -1,5 +1,114 @@
 #include "../../include/graph/host_graph.h"
 
+#include <sys/stat.h>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+
+// --------------------------------------------------------------------------- //
+// Binary CSR cache (undirected path only)
+//
+// Parsing a multi-GB .mtx costs minutes: the parse is a single-threaded
+// fgets/atoi loop, and the symmetric branch then does a stable sort over 2*nnz.
+// A benchmark campaign re-runs the same graph repeatedly and pays that every
+// time for nothing. After the first successful load we dump the CSR beside the
+// .mtx and reuse it whenever it is at least as new as the .mtx.
+//
+// Weights are deliberately NOT stored: both loader branches hardcode every
+// weight to 1.0, so they are regenerated on read. That saves 8 B/arc -- 8 GB on
+// a billion-arc graph.
+//
+// Set MG_GCD_NO_CSR_CACHE=1 to bypass entirely (used to prove the cached and
+// uncached paths produce identical partitions).
+// --------------------------------------------------------------------------- //
+namespace {
+
+const uint64_t kCacheMagic   = 0x4D47435352763031ULL;   // "MGCSRv01"
+const uint64_t kCacheVersion = 1;                       // bump if loader semantics change
+
+std::string csr_cache_path(const char *graph_path) {
+    return std::string(graph_path) + ".csr.bin";
+}
+
+bool cache_disabled() {
+    const char *e = getenv("MG_GCD_NO_CSR_CACHE");
+    return e && *e && *e != '0';
+}
+
+// Only trust a cache that is at least as new as the graph it came from.
+bool cache_is_fresh(const std::string &cache, const char *graph_path) {
+    struct stat cs{}, gs{};
+    if (stat(cache.c_str(), &cs) != 0) return false;
+    if (stat(graph_path, &gs) != 0) return false;
+    return cs.st_mtime >= gs.st_mtime;
+}
+
+bool try_load_csr_cache(const char *graph_path, vertex_t *n_out, edge_t *e_out,
+                        vertex_t **offset_out, edge_t **col_out, weight_t **val_out) {
+    if (cache_disabled()) return false;
+    const std::string cache = csr_cache_path(graph_path);
+    if (!cache_is_fresh(cache, graph_path)) return false;
+
+    FILE *f = fopen(cache.c_str(), "rb");
+    if (!f) return false;
+
+    uint64_t magic = 0, version = 0, n64 = 0, e64 = 0;
+    bool ok = fread(&magic, 8, 1, f) == 1 && fread(&version, 8, 1, f) == 1 &&
+              fread(&n64, 8, 1, f) == 1 && fread(&e64, 8, 1, f) == 1 &&
+              magic == kCacheMagic && version == kCacheVersion;
+    // vertex_t / edge_t are uint32; refuse a cache that would not fit them
+    if (ok && (n64 > 0xFFFFFFFFULL || e64 > 0xFFFFFFFFULL)) ok = false;
+    if (!ok) { fclose(f); return false; }
+
+    const size_t n = (size_t) n64, e = (size_t) e64;
+    // malloc, not new[]: ~HostGraph frees these with free()
+    vertex_t *offset = (vertex_t *) malloc(sizeof(vertex_t) * (n + 1));
+    edge_t   *col    = (edge_t *)   malloc(sizeof(edge_t) * e);
+    weight_t *val    = (weight_t *) malloc(sizeof(weight_t) * e);
+    if (!offset || !col || !val) {
+        free(offset); free(col); free(val); fclose(f);
+        return false;
+    }
+
+    ok = fread(offset, sizeof(vertex_t), n + 1, f) == n + 1 &&
+         fread(col, sizeof(edge_t), e, f) == e;
+    fclose(f);
+    if (!ok) { free(offset); free(col); free(val); return false; }
+
+    for (size_t i = 0; i < e; ++i) val[i] = 1.0;
+
+    *n_out = (vertex_t) n64; *e_out = (edge_t) e64;
+    *offset_out = offset; *col_out = col; *val_out = val;
+    return true;
+}
+
+// Best effort: a failure here costs nothing but a slow load next time.
+// Written to a temp file and renamed so an interrupted write can never leave a
+// truncated cache that a later run would trust.
+void write_csr_cache(const char *graph_path, vertex_t n, edge_t e,
+                     const vertex_t *offset, const edge_t *col) {
+    if (cache_disabled()) return;
+    const std::string cache = csr_cache_path(graph_path);
+    const std::string tmp = cache + ".tmp";
+
+    FILE *f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    uint64_t magic = kCacheMagic, version = kCacheVersion, n64 = n, e64 = e;
+    bool ok = fwrite(&magic, 8, 1, f) == 1 && fwrite(&version, 8, 1, f) == 1 &&
+              fwrite(&n64, 8, 1, f) == 1 && fwrite(&e64, 8, 1, f) == 1 &&
+              fwrite(offset, sizeof(vertex_t), (size_t) n + 1, f) == (size_t) n + 1 &&
+              fwrite(col, sizeof(edge_t), (size_t) e, f) == (size_t) e;
+    ok = (fclose(f) == 0) && ok;
+    if (ok) {
+        if (rename(tmp.c_str(), cache.c_str()) != 0) remove(tmp.c_str());
+    } else {
+        remove(tmp.c_str());
+    }
+}
+
+}  // namespace
+
 HostGraph::HostGraph(char *graph_path, int my_pe, bool directed):
 total_vertices_(0), total_edge_(0), host_offset_(nullptr),
 host_edge_(nullptr), host_edge_weight_(nullptr), mass_(0),
@@ -44,10 +153,17 @@ host_s_out_(nullptr), total_in_edge_(0), directed_(false)
 }
 
 void HostGraph::load_graph_mtx(char *graph_path) {
+    if (try_load_csr_cache(graph_path, &total_vertices_, &total_edge_,
+                           &host_offset_, &host_edge_, &host_edge_weight_)) {
+        std::cout << "[cache] CSR read from " << csr_cache_path(graph_path)
+                  << " (skipped .mtx parse)" << std::endl;
+        return;
+    }
     if(loadMMSparseMatrix(graph_path, 'd', true, &total_vertices_, &total_vertices_, &total_edge_,
                                  &host_edge_weight_, &host_offset_, &host_edge_, true)){
         exit(EXIT_FAILURE);
     }
+    write_csr_cache(graph_path, total_vertices_, total_edge_, host_offset_, host_edge_);
 }
 
 void HostGraph::randomly_generate_graph(int random_vertex_num, double sparsity) {

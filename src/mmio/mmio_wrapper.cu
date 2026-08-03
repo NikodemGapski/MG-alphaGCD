@@ -269,7 +269,10 @@ void init_data_from_mtx(char *file_path, vertex_t *&offset, edge_t *&colindex, w
         colindex = new edge_t[nnz_symmetric];
         value = new weight_t[nnz_symmetric];
 
-        omp_set_num_threads(80);
+        // Was hardcoded to 80. A SLURM job typically gets far fewer cores than that
+        // (16 for a 2-GPU allocation here), so 80 threads just oversubscribed the
+        // cgroup. Honour whatever OMP_NUM_THREADS / the allocation actually provides.
+        omp_set_num_threads(omp_get_max_threads());
         edge_t* Counter = new edge_t [nrow];
 #pragma omp parallel for
         for (vertex_t k = 0; k < nrow; k++)

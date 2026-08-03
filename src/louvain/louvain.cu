@@ -2786,17 +2786,19 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
 
     // Flat map from an ORIGINAL vertex to its community at the current level. Each phase
     // composes this with the level's assignment, so after the last phase it is the full
-    // hierarchical partition. Only meaningful at -np 1 (community_ids is distributed).
+    // hierarchical partition.
+    //
+    // Works at any -np. community_ids IS distributed -- each PE holds only its own vertex
+    // slice -- so the per-phase composition below gathers the slices over MPI first. This
+    // matters beyond convenience: the section 3 trust gate (rescore the emitted partition
+    // on the CPU and check it against the GPU's own L) is the only defence against the
+    // class of bug section 2 describes, and without -out it could not be applied to any
+    // multi-GPU result at all.
     const vertex_t original_vertices = total_vertices;
     std::vector<vertex_t> orig_to_comm;
     if (!out_path.empty()) {
-        if (n_pes != 1) {
-            if (my_pe == 0)
-                printf("[WARN] -out is only supported at -np 1 (community_ids is distributed); skipping.\n");
-        } else {
-            orig_to_comm.resize(original_vertices);
-            std::iota(orig_to_comm.begin(), orig_to_comm.end(), 0);
-        }
+        orig_to_comm.resize(original_vertices);
+        std::iota(orig_to_comm.begin(), orig_to_comm.end(), 0);
     }
 
     // private memory
@@ -3423,13 +3425,35 @@ void louvain::run(HostGraph *hostGraph, GpuGraph *gpuGraph, const double thresho
         // compacts it (renew_community_id_cuda: dense = scan(used)[old] - 1). Reproduce that
         // same compaction here so orig_to_comm stays in the NEXT level's vertex space.
         if (!orig_to_comm.empty()) {
-            std::vector<vertex_t> level_comm(local_vertices);
-            CUDA_RT_CALL(cudaMemcpy(level_comm.data(), shared_device_community_ids,
+            // shared_device_community_ids is LOCAL-indexed ([0, local_vertices), see
+            // init_community_id) but stores GLOBAL community ids, and each PE only
+            // maintains its own slice. Gather the slices into the whole level's map,
+            // laid out by global vertex id, before composing.
+            std::vector<vertex_t> level_local(local_vertices);
+            CUDA_RT_CALL(cudaMemcpy(level_local.data(), shared_device_community_ids,
                                     sizeof(vertex_t) * local_vertices, cudaMemcpyDeviceToHost));
-            std::vector<vertex_t> dense(local_vertices, 0);
-            for (vertex_t v = 0; v < local_vertices; ++v) dense[level_comm[v]] = 1;
+            std::vector<vertex_t> level_comm(total_vertices);
+            if (n_pes == 1) {
+                level_comm.swap(level_local);
+            } else {
+                std::vector<int> counts(n_pes), displs(n_pes);
+                for (int p = 0; p < n_pes; ++p) {
+                    displs[p] = (int) part_vertex_offset[p];
+                    counts[p] = (int) (part_vertex_offset[p + 1] - part_vertex_offset[p]);
+                }
+                MPI_CALL(MPI_Allgatherv(level_local.data(), counts[my_pe], MPI_UINT32_T,
+                                        level_comm.data(), counts.data(), displs.data(),
+                                        MPI_UINT32_T, MPI_COMM_WORLD));
+            }
+            // Reproduce renew_community_id_cuda's compaction exactly: it scans the GLOBAL
+            // community space and writes com_size[old] - 1, i.e. an inclusive scan of the
+            // "used" flags minus one. The scan must therefore run over ALL vertices of the
+            // level, not just this PE's slice, or the dense ids would disagree with the
+            // coarse graph the next phase is built on.
+            std::vector<vertex_t> dense(total_vertices, 0);
+            for (vertex_t v = 0; v < total_vertices; ++v) dense[level_comm[v]] = 1;
             vertex_t run_sum = 0;
-            for (vertex_t c = 0; c < local_vertices; ++c) { run_sum += dense[c]; dense[c] = run_sum - 1; }
+            for (vertex_t c = 0; c < total_vertices; ++c) { run_sum += dense[c]; dense[c] = run_sum - 1; }
             for (vertex_t v = 0; v < original_vertices; ++v)
                 orig_to_comm[v] = dense[level_comm[orig_to_comm[v]]];
         }
